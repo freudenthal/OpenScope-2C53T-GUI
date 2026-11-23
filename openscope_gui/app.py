@@ -1,9 +1,10 @@
 """`openscope-gui`: live scope and meter view of the unit over USB CDC.
 
-v1 is read-only except button injection (stage-060): no timebase, range or
-trigger commands. One reader thread owns the port (worker.py); a 30 Hz timer
-draws the latest data; the status bar shows connection, mode, battery, link
-frames/s, redraws/s and the frame's trust flags.
+Stage-085 adds the scope settings (run/stop, timebase, volts/div, trigger,
+mode) through the 080 control surface; the window shows the state the unit
+reports back, never the value it asked for. One reader thread owns the port
+(worker.py); a 30 Hz timer draws the latest data; the status bar shows
+connection, mode, battery, link frames/s, redraws/s and the frame's trust flags.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import proto
+from ..cli import _state_lines
 from .views import MeterView, Rate, ScopeView
 from .worker import ScopeFrame, Worker
 
@@ -23,6 +25,8 @@ DRAW_HZ = 30
 KEYS = [["CH1", "CH2", "MOVE", "SELECT", "TRIGGER"],
         ["PRM", "AUTO", "SAVE", "MENU", "OK"],
         ["UP", "DOWN", "LEFT", "RIGHT"]]          # POWER left out on purpose (shuts the unit down)
+PROBE_NOTE = ("Volts include the unit's probe setting (x1/x10), which is not sent over USB: "
+              "check it on the unit (C-100, G-280).")
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -63,6 +67,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.shot = QtWidgets.QPushButton("Screenshot…")
         self.shot.clicked.connect(self._screenshot)
         v.addWidget(self.shot)
+        self.hold_shot = QtWidgets.QCheckBox("Hold scope for screenshot")
+        self.hold_shot.setToolTip("STOP for the dump, then RUN again: a live screen is torn (G-260)")
+        self.hold_shot.setChecked(True)
+        v.addWidget(self.hold_shot)
         self.save = QtWidgets.QPushButton("Save frame (.npz)…")
         self.save.clicked.connect(self._save_npz)
         v.addWidget(self.save)
@@ -70,6 +78,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.follow.setChecked(True)
         self.follow.toggled.connect(lambda on: setattr(self, "_follow_mode", on))
         v.addWidget(self.follow)
+        v.addWidget(self._settings_box())
         keys = QtWidgets.QGroupBox("Unit buttons")
         g = QtWidgets.QGridLayout(keys)
         for r, row in enumerate(KEYS):
@@ -106,6 +115,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.meter.connect(self.meter.add)
         worker.note.connect(self._note)
         worker.job_done.connect(self._job_done)
+        worker.scope_state.connect(self._scope_state)
         self.timer = QtCore.QTimer(self)
         self.timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.timer.timeout.connect(self._tick)
@@ -126,6 +136,105 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, activated=self._grab)
         self._state = "searching"
 
+    # ── scope settings (stage-085) ─────────────────────────────────
+    def _settings_box(self) -> QtWidgets.QGroupBox:
+        """Widgets fill from SCOPE_STATE without sending anything: combos act on
+        `activated` (user only), the level on `editingFinished` (user only)."""
+        self.st: Optional[proto.ScopeState] = None
+        box = QtWidgets.QGroupBox("Scope settings")
+        f = QtWidgets.QFormLayout(box)
+        self.run_btn = QtWidgets.QPushButton("Stop")
+        self.run_btn.clicked.connect(self._toggle_run)
+        f.addRow("Run/stop", self.run_btn)
+        self.mode_cb = QtWidgets.QComboBox()
+        self.mode_cb.addItems([proto.MODES[i] for i in sorted(proto.MODES)])
+        self.mode_cb.activated.connect(lambda i: self.worker.set("mode", proto.MODES[i]))
+        f.addRow("Mode", self.mode_cb)
+        self.tb_cb = QtWidgets.QComboBox()
+        self.tb_cb.addItems([f"0x{c:02X}" for c in range(proto.TIMEBASE_CODES)])
+        self.tb_cb.activated.connect(lambda i: self.worker.set("timebase", i))
+        f.addRow("Timebase", self.tb_cb)
+        self.vdiv_cb = []
+        for ch in (1, 2):
+            cb = QtWidgets.QComboBox()
+            cb.addItems([f"range {r}" for r in range(proto.VDIV_RANGES)])
+            cb.activated.connect(lambda r, ch=ch: self.worker.set("vdiv", ch, r))
+            f.addRow(f"CH{ch} volts/div", cb)
+            self.vdiv_cb.append(cb)
+        self.tmode_cb = QtWidgets.QComboBox()
+        self.tmode_cb.addItems([proto.TRIG_MODES[i] for i in sorted(proto.TRIG_MODES)])
+        self.tedge_cb = QtWidgets.QComboBox()
+        self.tedge_cb.addItems([proto.TRIG_EDGES[i] for i in sorted(proto.TRIG_EDGES)])
+        self.tsrc_cb = QtWidgets.QComboBox()
+        self.tsrc_cb.addItems([proto.TRIG_SOURCES[i] for i in sorted(proto.TRIG_SOURCES)])
+        for cb in (self.tmode_cb, self.tedge_cb, self.tsrc_cb):
+            cb.activated.connect(self._send_trigger)
+        self.level_sb = QtWidgets.QSpinBox()
+        self.level_sb.setRange(-proto.TRIG_LEVEL_MAX, proto.TRIG_LEVEL_MAX)
+        self.level_sb.setKeyboardTracking(False)
+        self.level_sb.editingFinished.connect(self._level_done)
+        trig = QtWidgets.QHBoxLayout()
+        for w in (self.tmode_cb, self.tedge_cb, self.tsrc_cb, self.level_sb):
+            trig.addWidget(w)
+        f.addRow("Trigger", trig)
+        self.state_lbl = QtWidgets.QLabel("no scope state yet")
+        self.state_lbl.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        self.state_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        f.addRow(self.state_lbl)
+        probe = QtWidgets.QLabel(PROBE_NOTE)
+        probe.setWordWrap(True)
+        f.addRow(probe)
+        self.settings = box
+        box.setEnabled(False)
+        return box
+
+    def _toggle_run(self) -> None:
+        if self.st is not None:
+            self.worker.set("run", not self.st.running)
+
+    def _send_trigger(self, *_):
+        self.worker.set("trigger", self.tmode_cb.currentText(), self.tedge_cb.currentText(),
+                        self.tsrc_cb.currentText(), self.level_sb.value())
+
+    def _level_done(self) -> None:
+        if self.st is None or self.level_sb.value() != self.st.trig_level:
+            self._send_trigger()
+
+    def _scope_state(self, s: proto.ScopeState) -> None:
+        self.st = s
+        self.settings.setEnabled(True)
+        self.run_btn.setText("Stop" if s.running else "Run")
+        self.run_btn.setStyleSheet("" if s.running else "background:#eb5757; color:white; font-weight:bold")
+        self.mode_cb.setCurrentIndex(s.mode)
+        self.tb_cb.setCurrentIndex(s.timebase_code)
+        for cb, c in zip(self.vdiv_cb, s.ch):
+            cb.setCurrentIndex(c.vdiv_idx)
+        self.tmode_cb.setCurrentIndex(s.trig_mode)
+        self.tedge_cb.setCurrentIndex(s.trig_edge)
+        self.tsrc_cb.setCurrentIndex(s.trig_source)
+        if not self.level_sb.hasFocus():        # never overwrite a level being typed
+            self.level_sb.setValue(s.trig_level)
+        self.state_lbl.setText("\n".join(_state_lines(s)))
+        if self.scope.frame is not None:        # a held frame gets no new frame signal
+            self._frame_flags(self.scope.frame)
+
+    def frame_notes(self, f: ScopeFrame) -> list:
+        """STOPPED / held-record notes for a frame against the state in force."""
+        s = self.st
+        if s is None:
+            return []
+        notes = [] if s.running else ["STOPPED (held record)"]
+        diffs = []
+        if f.timebase_idx != s.timebase_code:
+            diffs.append(f"timebase 0x{f.timebase_idx:02X} (now 0x{s.timebase_code:02X})")
+        for w in f.waves:
+            now = s.ch[w.channel].vdiv_idx
+            if w.vdiv_idx != now:
+                diffs.append(f"{w.channel_name} range {w.vdiv_idx} (now {now})")
+        if diffs:
+            notes.append("record taken at " + ", ".join(diffs))
+        return notes
+
     def _event(self, text: str) -> None:
         if self._events:
             self._events.write(f"{time.time():.3f} {time.strftime('%H:%M:%S')} {text}\n")
@@ -142,6 +251,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_conn.setToolTip(detail)
         if state != "connected":
             self.sb_mode.setText("")
+            self.settings.setEnabled(False)
+            self.st = None
             if state == "disconnected":
                 self.sb_note.setText(detail[:120])
 
@@ -163,11 +274,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _frame(self, f: ScopeFrame) -> None:
         self.scope.set_frame(f)
-        trust = [f"rate {f.timebase_tier}" + (f" {f.sample_rate_hz} S/s" if f.sample_rate_hz else ""),
+        self._frame_flags(f)
+
+    def _frame_flags(self, f: ScopeFrame) -> None:
+        trust =[f"rate {f.timebase_tier}" + (f" {f.sample_rate_hz} S/s" if f.sample_rate_hz else ""),
                  "calibrated" if f.calibrated else "uncalibrated"]
         if f.waves[0].timebase_disagrees:
             trust.append("timebase disagrees")
-        self.sb_flags.setText(f"#{f.frame_id} tb 0x{f.timebase_idx:02X} | " + ", ".join(trust))
+        notes = self.frame_notes(f)
+        text = f"#{f.frame_id} tb 0x{f.timebase_idx:02X} | " + ", ".join(trust)
+        if notes:
+            text += " | <b style='color:#eb5757'>" + "; ".join(notes) + "</b>"
+        self.sb_flags.setText(text)
 
     def _note(self, text: str) -> None:
         self._event(f"note {text}")
@@ -216,7 +334,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Unit screenshot", time.strftime("screen_%Y%m%d_%H%M%S.png"), "PNG (*.png)")
         if path:
             self.shot.setEnabled(False)
-            self.worker.screenshot(path)
+            self.worker.screenshot(path, hold=self.hold_shot.isChecked())
 
     def _save_npz(self) -> None:
         f = self.scope.frame

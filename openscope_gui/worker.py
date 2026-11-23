@@ -7,10 +7,16 @@ in order. The GUI thread only queues jobs and receives signals.
 One loop iteration (`step()`):
   * not connected: try `Device.open()`; on failure wait `retry_s` and report
     "searching" (once per state change, not every attempt);
-  * connected: run queued jobs; poll STATUS every `status_s`; in scope mode
-    ask for one capture, in meter mode for one meter reading; emit only NEW
-    data (a frame_id / update_count that changed), so a stopped or held scope
-    does not repaint the same record as if it were live.
+  * connected: run queued jobs; poll STATUS (and SCOPE_STATE, stage-085) every
+    `status_s`; in scope mode ask for one capture, in meter mode for one meter
+    reading; emit only NEW data (a frame_id / update_count that changed), so a
+    stopped or held scope does not repaint the same record as if it were live.
+
+Scope sets (stage-085) are jobs too: `set("timebase", 0x10)` etc. call the
+Device method on this thread, then read SCOPE_STATE and emit it, so the window
+shows the state in force, never the value it asked for. A refusal is a failed
+job with the reason. Firmware without GET_SCOPE_STATE is noted once and not
+polled again until the next connect.
 
 NAKs are normal (NO_CAPTURE_DATA before the first capture, NOT_READY when no
 tear-free copy could be taken or the meter is blank — G-220, G-230): they are
@@ -32,6 +38,10 @@ from .. import proto
 from ..device import Device, DeviceError, Nak, Timeout
 
 MODE_SCOPE, MODE_METER = 0, 1
+
+# set(what, *args) -> Device method (stage-085, the 080 control surface)
+SETTERS = {"mode": "set_mode", "timebase": "set_timebase", "vdiv": "set_vdiv",
+           "trigger": "set_trigger", "run": "run_stop"}
 
 
 @dataclass(frozen=True)
@@ -72,7 +82,8 @@ class Worker(QtCore.QThread):
     frame = QtCore.Signal(object)           # ScopeFrame (new frame_id only)
     meter = QtCore.Signal(object)           # MeterSample (new update_count only)
     note = QtCore.Signal(str)               # a NAK or soft error, for the status bar
-    job_done = QtCore.Signal(str, bool, str)  # job ("press"/"screenshot"), ok, message
+    job_done = QtCore.Signal(str, bool, str)  # job ("press"/"screenshot"/"set"), ok, message
+    scope_state = QtCore.Signal(object)     # proto.ScopeState (with STATUS, and after each set)
 
     MAX_TIMEOUTS = 3        # consecutive request timeouts before the link counts as lost
 
@@ -96,6 +107,7 @@ class Worker(QtCore.QThread):
         self._last_fid: Optional[int] = None
         self._last_uc: Optional[int] = None
         self._timeouts = 0
+        self.has_state: Optional[bool] = None   # None = not asked yet on this connection
         self.stats = {"frames": 0, "meter": 0, "naks": 0, "connects": 0, "losses": 0}
 
     # ── called from the GUI thread ────────────────────────────────
@@ -107,8 +119,16 @@ class Worker(QtCore.QThread):
     def press(self, button) -> None:
         self._jobs.put(("press", proto.button_id(button)))
 
-    def screenshot(self, path: str) -> None:
-        self._jobs.put(("screenshot", path))
+    def screenshot(self, path: str, hold: bool = False) -> None:
+        """hold=True: STOP the scope for the dump if it runs, then RUN again
+        (a held screen passes the CRC; a live one is torn, G-260)."""
+        self._jobs.put(("screenshot", (path, hold)))
+
+    def set(self, what: str, *args) -> None:
+        """Queue one scope set: mode, timebase, vdiv, trigger or run (stage-085)."""
+        if what not in SETTERS:
+            raise ValueError(f"unknown setting {what!r}; one of {', '.join(SETTERS)}")
+        self._jobs.put(("set", (what, args)))
 
     def stop(self, wait_ms: int = 5000) -> bool:
         self._halt.set()
@@ -153,6 +173,7 @@ class Worker(QtCore.QThread):
                 return
             self.stats["connects"] += 1
             self._last_status, self._last_fid, self._last_uc, self._timeouts = -1e9, None, None, 0
+            self.has_state = None
             self._set_state("connected", getattr(self.dev.link, "port", "") or "")
         try:
             self._run_jobs()
@@ -161,6 +182,7 @@ class Worker(QtCore.QThread):
                 self._last_status = self._clock()
                 self.mode = st.mode
                 self.status.emit(st)
+                self._poll_state()
             if self.paused:
                 self._pause(self.idle_s)
             elif self.mode == MODE_SCOPE:
@@ -196,6 +218,22 @@ class Worker(QtCore.QThread):
         else:
             self._pause(self.idle_s)
 
+    def _poll_state(self) -> None:
+        """SCOPE_STATE, unless this firmware has shown it has none."""
+        if self.has_state is False:
+            return
+        try:
+            s = self.dev.scope_state()
+        except Nak as e:
+            if self.has_state is None:          # older image: no control surface
+                self.has_state = False
+                self.note.emit(f"no scope controls on this firmware "
+                               f"(GET_SCOPE_STATE: {proto.ERRORS.get(e.code, hex(e.code))})")
+                return
+            raise
+        self.has_state = True
+        self.scope_state.emit(s)
+
     def _poll_meter(self) -> None:
         m = self.dev.meter()
         if m.update_count != self._last_uc:
@@ -216,14 +254,40 @@ class Worker(QtCore.QThread):
                     self.job_done.emit(job, True, proto_button_name(arg))
                     self._last_status = -1e9        # a press may change the mode: poll now
                 elif job == "screenshot":
-                    from ..screen import save_png
-                    s = self.dev.screenshot()
-                    save_png(arg, s.w, s.h, s.indexed4, scale=2)
-                    crc = "transport CRC ok, screen changed during capture" if s.torn else "CRC ok"
-                    self.job_done.emit(job, True, f"{arg} ({s.w}x{s.h}, {crc})")
-            except (Nak, DeviceError, OSError) as e:
+                    self._screenshot_job(*arg)
+                elif job == "set":
+                    what, args = arg
+                    getattr(self.dev, SETTERS[what])(*args)
+                    self.job_done.emit(job, True, f"{what} {' '.join(str(a) for a in args)}".strip())
+                    if what == "mode":
+                        self._last_status = -1e9    # STATUS knows the mode first: poll now
+                    self._poll_state()
+            except Nak as e:
+                name = proto.ERRORS.get(e.code, hex(e.code))
+                what = f"{arg[0]} " if job == "set" else ""
+                self.job_done.emit(job, False, f"{what}refused: {name}: {proto.NAK_HINTS.get(name, '')}".rstrip(": "))
+            except (DeviceError, OSError) as e:
                 # Not a link loss by itself: the next STATUS poll decides that.
                 self.job_done.emit(job, False, f"{type(e).__name__}: {e}")
+
+    def _screenshot_job(self, path: str, hold: bool) -> None:
+        from ..screen import save_png
+        held = False
+        try:
+            if hold and self.has_state:
+                if self.dev.scope_state().running:
+                    self.dev.run_stop(False)
+                    held = True
+            s = self.dev.screenshot()
+        finally:
+            if held:
+                self.dev.run_stop(True)     # a failed dump must not leave the scope stopped
+        if held or hold:
+            self._poll_state()
+        save_png(path, s.w, s.h, s.indexed4, scale=2)
+        crc = "transport CRC ok, screen changed during capture" if s.torn else "CRC ok"
+        how = ", held" if held else ""
+        self.job_done.emit("screenshot", True, f"{path} ({s.w}x{s.h}, {crc}{how})")
 
     def _fail_queued_jobs(self, why: str) -> None:
         while True:

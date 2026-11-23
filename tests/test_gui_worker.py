@@ -37,6 +37,11 @@ def reading(uc, value=3.254):
     return proto.MeterReading(uc, value, 3254, 3, 1, 0x04, 0, 0, "V", "3.254")
 
 
+def scope_state(running=True, tb=0x10, mode=0, r1=6, r2=7, tmode=0, level=0):
+    ch = (proto.ScopeChannel(True, r1, 2, 42950), proto.ScopeChannel(True, r2, 2, 88420))
+    return proto.ScopeState(1, mode, running, tb, tb, 2, tmode, 0, 0, level, 12490, 0x80, 32, ch)
+
+
 class FakeLink:
     port = "COMFAKE"
 
@@ -53,6 +58,9 @@ class FakeDevice:
         self.calls = []
         self.closed = False
         self.screen = Screen(0, 0, 4, 2, bytes([0x01, 0x23, 0x45, 0x67]))
+        self.state = scope_state()
+        self.state_error = None             # e.g. Nak: firmware without the control surface
+        self.set_error = None
 
     @staticmethod
     def _next(q):
@@ -79,7 +87,40 @@ class FakeDevice:
 
     def screenshot(self):
         self.calls.append("screenshot")
+        if isinstance(self.screen, BaseException):
+            raise self.screen
         return self.screen
+
+    def scope_state(self):
+        self.calls.append("scope_state")
+        if self.state_error is not None:
+            raise self.state_error
+        return self.state
+
+    def _set(self, name, *args, **change):
+        self.calls.append((name,) + args)
+        if self.set_error is not None:
+            raise self.set_error
+        fields = {f: getattr(self.state, f) for f in self.state.__dataclass_fields__}
+        fields.update(change)
+        self.state = proto.ScopeState(**fields)
+
+    def set_mode(self, m):
+        self._set("set_mode", m, mode=proto.mode_id(m))
+
+    def set_timebase(self, code):
+        self._set("set_timebase", code, timebase_idx=code, timebase_code=code)
+
+    def set_vdiv(self, ch, r):
+        chans = list(self.state.ch)
+        chans[ch - 1] = proto.ScopeChannel(True, r, 2, 1)
+        self._set("set_vdiv", ch, r, ch=tuple(chans))
+
+    def set_trigger(self, mode, edge="rising", source="CH1", level=0):
+        self._set("set_trigger", mode, edge, source, level, trig_level=level)
+
+    def run_stop(self, running):
+        self._set("run_stop", running, running=running)
 
     def close(self):
         self.closed = True
@@ -109,7 +150,9 @@ class TestWorker(unittest.TestCase):
     def make(self, opener, **kw):
         kw.setdefault("status_s", 0.0)
         w = Worker(opener, retry_s=0.0, idle_s=0.0, meter_s=0.0, nak_s=0.0, **kw)
-        self.ev = {"connection": [], "status": [], "frame": [], "meter": [], "note": [], "job": []}
+        self.ev = {"connection": [], "status": [], "frame": [], "meter": [], "note": [], "job": [],
+                   "state": []}
+        w.scope_state.connect(lambda s: self.ev["state"].append(s))
         w.connection.connect(lambda s, d: self.ev["connection"].append((s, d)))
         w.status.connect(lambda st: self.ev["status"].append(st))
         w.frame.connect(lambda f: self.ev["frame"].append(f))
@@ -169,12 +212,13 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(self.ev["note"], ["NOT_READY"])
         self.assertNotIn(("waveform", 1), dev.calls)       # no scope polls in meter mode
 
-    def test_other_modes_poll_status_only(self):
+    def test_other_modes_poll_status_and_state_only(self):
         dev = FakeDevice(mode=3)
         w = self.make(Opener(dev))
         w.step()
         w.step()
-        self.assertEqual(dev.calls, ["status", "status"])
+        self.assertEqual(dev.calls, ["status", "scope_state"] * 2)
+        self.assertEqual(len(self.ev["state"]), 2)
 
     def test_status_is_rate_limited(self):
         t = [0.0]
@@ -260,6 +304,102 @@ class TestWorker(unittest.TestCase):
         w.step()
         self.assertFalse(self.ev["job"][0][1])
         self.assertEqual(self.states(), ["connected"])
+
+    # ── stage-085: scope sets, state, held screenshot ─────────────
+    def test_each_set_calls_its_device_method_then_emits_the_state(self):
+        dev = FakeDevice()
+        w = self.make(Opener(dev), status_s=10.0)
+        w.step()
+        for what, args, call in (("timebase", (0x14,), ("set_timebase", 0x14)),
+                                 ("vdiv", (2, 5), ("set_vdiv", 2, 5)),
+                                 ("trigger", ("normal", "falling", "CH2", -30),
+                                  ("set_trigger", "normal", "falling", "CH2", -30)),
+                                 ("run", (False,), ("run_stop", False)),
+                                 ("mode", ("meter",), ("set_mode", "meter"))):
+            n = len(self.ev["state"])
+            w.set(what, *args)
+            w.step()
+            i = dev.calls.index(call)
+            self.assertEqual(dev.calls[i + 1], "scope_state", what)
+            self.assertGreaterEqual(len(self.ev["state"]), n + 1, what)   # mode also re-polls STATUS
+            self.assertEqual(self.ev["job"][-1][:2], ("set", True))
+        s = self.ev["state"][-1]
+        self.assertEqual((s.timebase_code, s.ch[1].vdiv_idx, s.trig_level, s.running, s.mode),
+                         (0x14, 5, -30, False, 1))
+        with self.assertRaises(ValueError):
+            w.set("bandwidth", 1)
+
+    def test_mode_set_forces_a_status_poll(self):
+        t = [0.0]
+        dev = FakeDevice()
+        w = self.make(Opener(dev), status_s=10.0, clock=lambda: t[0])
+        w.step()
+        n = dev.calls.count("status")
+        w.set("mode", "meter")
+        w.step()
+        self.assertEqual(dev.calls.count("status"), n + 1)
+
+    def test_refused_set_is_a_failed_job_with_the_reason(self):
+        dev = FakeDevice()
+        w = self.make(Opener(dev))
+        w.step()
+        dev.set_error = Nak(proto.CMD_SET_TIMEBASE, 0x07)       # NOT_READY
+        w.set("timebase", 0x12)
+        w.step()
+        job, ok, msg = self.ev["job"][-1]
+        self.assertEqual((job, ok), ("set", False))
+        self.assertIn("timebase refused: NOT_READY", msg)
+        self.assertIn("nothing changed", msg)
+        self.assertEqual(self.states(), ["connected"])
+
+    def test_firmware_without_state_is_noted_once_and_not_polled(self):
+        dev = FakeDevice(mode=3)
+        dev.state_error = Nak(proto.CMD_GET_SCOPE_STATE, 0x01)  # UNKNOWN_CMD on an old image
+        w = self.make(Opener(dev))
+        for _ in range(3):
+            w.step()
+        self.assertEqual(dev.calls.count("scope_state"), 1)
+        self.assertEqual(len(self.ev["note"]), 1)
+        self.assertIn("no scope controls", self.ev["note"][0])
+        self.assertEqual(self.states(), ["connected"])
+
+    def _shot(self, dev, hold=True):
+        w = self.make(Opener(dev), status_s=10.0)
+        w.step()
+        start = len(dev.calls)
+        with tempfile.TemporaryDirectory() as d:
+            w.screenshot(os.path.join(d, "s.png"), hold=hold)
+            w.step()
+        return dev.calls[start:], self.ev["job"][-1]
+
+    def test_held_screenshot_stops_dumps_and_runs_again(self):
+        calls, (job, ok, msg) = self._shot(FakeDevice())
+        i = calls.index(("run_stop", False))
+        self.assertEqual(calls[i:i + 3], [("run_stop", False), "screenshot", ("run_stop", True)])
+        self.assertTrue(ok)
+        self.assertIn("held", msg)
+
+    def test_held_screenshot_leaves_a_stopped_scope_stopped(self):
+        dev = FakeDevice()
+        dev.state = scope_state(running=False)
+        calls, (_, ok, msg) = self._shot(dev)
+        self.assertNotIn(("run_stop", False), calls)
+        self.assertNotIn(("run_stop", True), calls)
+        self.assertTrue(ok)
+        self.assertNotIn("held", msg)
+
+    def test_held_screenshot_runs_again_when_the_dump_fails(self):
+        dev = FakeDevice()
+        dev.screen = DeviceError("screenshot failed after 3 attempts")
+        calls, (job, ok, _) = self._shot(dev)
+        i = calls.index("screenshot")
+        self.assertEqual(calls[i + 1], ("run_stop", True))
+        self.assertFalse(ok)
+
+    def test_unheld_screenshot_does_not_touch_run_stop(self):
+        calls, (_, ok, _) = self._shot(FakeDevice(), hold=False)
+        self.assertEqual([c for c in calls if isinstance(c, tuple) and c[0] == "run_stop"], [])
+        self.assertTrue(ok)
 
     def test_thread_delivers_frames_and_stops(self):
         """The real QThread: signals cross to this thread's event loop."""
