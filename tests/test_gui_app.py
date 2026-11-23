@@ -165,7 +165,7 @@ class TestScopePanel(WindowCase):
         self.assertEqual(p.vdiv_cb[1].currentText(), "617 mV/div")
         self.assertEqual(p.probe_cb[0].currentText(), "×10")
         self.assertEqual((p.tmode_cb.currentText(), p.tedge_cb.currentText(), p.tsrc_cb.currentText()),
-                         ("Single", "Falling edge", "CH2"))
+                         ("Single", "Falling edge", "CH2 (not working yet)"))
         self.assertEqual(p.level_sb.suffix(), " V")
         self.assertEqual(p.level(), -40)
         self.assertEqual(p.run_btn.text(), "Run")
@@ -219,6 +219,29 @@ class TestScopePanel(WindowCase):
         self.connect(st=state(tmode=2))
         self.win.panel.run_btn.click()
         self.assertEqual(self.jobs()[0], ("set", ("trigger", ("auto", "rising", "CH1", 0))))
+
+    def test_trigger_line_drag_and_level_50(self):
+        self.connect(st=state(level=21))
+        w, p = self.win, self.win.panel
+        self.assertEqual(w.scope.trig_line.value(), 126)       # where the unit fires, in counts
+        self.assertTrue(w.scope.trig_line.isVisible())
+        w.scope.level_dragged.emit(55.4)                        # the user drops the line at 55
+        lv = self.jobs()[0][1][1][3]
+        self.assertEqual(self.desc.trigger.record_counts(lv), 55)
+        w._scope_state(state(level=21))
+        sq = proto.Waveform(8, 0, 0, 0x10, 7, 1024, 24, 12490, 26030850, 32, 24, bytes([10, 100]) * 512)
+        w._frame(ScopeFrame.from_waves((sq,), 0.0))
+        self.assertIn("trigger level outside the CH1 signal", w.sb_scope.text())
+        p.level50_btn.click()
+        self.assertEqual(self.jobs(), [("set", ("trigger", ("auto", "rising", "CH1", lv)))])
+
+    def test_level_50_needs_ch1(self):
+        self.connect()
+        w2 = proto.Waveform(9, 1, 0, 0x10, 7, 1024, 24, 12490, 2466778, 32, 24, bytes(range(256)) * 4)
+        self.win._frame(ScopeFrame.from_waves((w2,), 0.0))
+        self.win.panel.level50_btn.click()
+        self.assertEqual(self.jobs(), [])
+        self.assertIn("Show CH1", self.win.sb_note.text())
 
     def test_single_record_note(self):
         self.connect(st=state(tmode=2))

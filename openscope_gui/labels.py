@@ -27,6 +27,12 @@ MODE_WORDS = {0: "Oscilloscope", 1: "Multimeter", 2: "Signal generator", 3: "Set
 TRIG_MODE_WORDS = {0: "Auto", 1: "Normal", 2: "Single"}
 TRIG_EDGE_WORDS = {0: "Rising edge", 1: "Falling edge"}
 TRIG_SOURCE_WORDS = {0: "CH1", 1: "CH2"}
+# Stage-087 bench (run 3): guest-coldtrace fires on CH1 whatever the source
+# setting (source CH2 with the level at the CH1 middle triggers as often as
+# source CH1; level at the CH2 middle: no records). Set True when a firmware
+# makes the CH2 source work (G-320).
+CH2_TRIGGER_WORKS = False
+CH2_SOURCE_NOTE = "the unit triggers on CH1 only (CH2 source does not work yet)"
 TIER_WORDS = {"measured": "measured", "provisional": "provisional", "none": "not calibrated"}
 SCREEN_COUNTS = 256             # ADC span of the screen height (8 bit record)
 APPROX = "≈ "
@@ -168,6 +174,30 @@ def word_items(words: dict, what: str) -> List[Item]:
     return [Item(k, v, f"{what} {k}", "measured") for k, v in sorted(words.items())]
 
 
+def source_items() -> List[Item]:
+    items = word_items(TRIG_SOURCE_WORDS, "Trigger source")
+    if not CH2_TRIGGER_WORKS:
+        items[1] = Item(1, "CH2 (not working yet)",
+                        "Trigger source 1. This firmware fires on CH1 whatever the source: the "
+                        "level is compared with CH1 (G-320)", "none")
+    return items
+
+
+def level_for_counts(desc: Optional[proto.Description], counts: float) -> Optional[int]:
+    """The UI level whose firing point (code + record offset) is nearest `counts`."""
+    if not desc or not desc.trigger:
+        return None
+    t = desc.trigger
+    return min(range(t.level_min, t.level_max + 1), key=lambda lv: abs(t.record_counts(lv) - counts))
+
+
+def trigger_counts(desc: Optional[proto.Description], state: Optional[proto.ScopeState]) -> Optional[int]:
+    """Record count where the unit fires at the level in force (the plot's y)."""
+    if not desc or not desc.trigger or state is None:
+        return None
+    return desc.trigger.record_counts(state.trig_level)
+
+
 # ── trigger level ─────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class LevelScale:
@@ -256,7 +286,8 @@ def trigger_words(state: proto.ScopeState, desc: Optional[proto.Description]) ->
     ls = level_scale(desc, state)
     return SEP.join([f"Trigger {TRIG_MODE_WORDS.get(state.trig_mode, '?')}",
                      TRIG_EDGE_WORDS.get(state.trig_edge, "?"),
-                     TRIG_SOURCE_WORDS.get(state.trig_source, "?"),
+                     TRIG_SOURCE_WORDS.get(state.trig_source, "?")
+                     + (" (not working yet)" if state.trig_source == 1 and not CH2_TRIGGER_WORKS else ""),
                      f"level {ls.text(state.trig_level)}"])
 
 
@@ -281,6 +312,14 @@ def frame_notes(frame, state: Optional[proto.ScopeState], desc: Optional[proto.D
         notes.append("rate withheld: the unit's screen shows another timebase")
     if state is None:
         return notes
+    fire = trigger_counts(desc, state)
+    ch1 = [w for w in frame.waves if w.channel == 0]
+    if fire is not None and ch1:
+        body = ch1[0].samples[ch1[0].head_skip:]
+        if body and not (min(body) < fire <= max(body)):
+            notes.append("trigger level outside the CH1 signal")
+    if state.trig_source == 1 and not CH2_TRIGGER_WORKS:
+        notes.append(CH2_SOURCE_NOTE)
     if state.trig_mode == 2:
         notes.insert(0, "single record")
     elif not state.running:

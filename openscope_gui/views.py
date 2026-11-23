@@ -109,6 +109,8 @@ class Rate:
 
 # ── scope ─────────────────────────────────────────────────────────────
 class ScopeView(QtWidgets.QWidget):
+    level_dragged = QtCore.Signal(float)    # ADC counts where the user dropped the trigger line
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.frame: Optional[ScopeFrame] = None
@@ -140,6 +142,20 @@ class ScopeView(QtWidgets.QWidget):
             ln.sigPositionChanged.connect(self._update_readout)
             self.plot.addItem(ln)
             self.cur.append(ln)
+        # trigger level (stage-087): where the hardware fires, in record counts; drag to set
+        self.trig_line = pg.InfiniteLine(pos=128, angle=0, movable=True,
+                                         pen=pg.mkPen(CH_COLORS[0], width=1, style=QtCore.Qt.DashLine),
+                                         hoverPen=pg.mkPen("#ffffff", width=2),
+                                         label="Trigger", labelOpts={"position": 0.03, "color": CH_COLORS[0]})
+        self.trig_line.setToolTip("Trigger level (drag to change). The unit fires on CH1.")
+        self.trig_line.sigPositionChangeFinished.connect(lambda ln: self.level_dragged.emit(ln.value()))
+        self.trig_line.hide()
+        self.plot.addItem(self.trig_line)
+        self.trig_mark = pg.InfiniteLine(pos=0, angle=90, movable=False,
+                                         pen=pg.mkPen(CH_COLORS[0], width=1, style=QtCore.Qt.DotLine),
+                                         label="T", labelOpts={"position": 0.03, "color": CH_COLORS[0]})
+        self.trig_mark.hide()
+        self.plot.addItem(self.trig_mark)
         self.tabs.addTab(self.plot, "Time")
         # FFT view
         self.fft = pg.PlotWidget()
@@ -168,6 +184,16 @@ class ScopeView(QtWidgets.QWidget):
         self._dirty = True
         self.frames_in.tick()
 
+    def set_trigger_level(self, counts: Optional[float]) -> None:
+        """Show the trigger level line at `counts` (None hides it). Never moves a
+        line the user is dragging."""
+        if counts is None:
+            self.trig_line.hide()
+            return
+        if not self.trig_line.moving:
+            self.trig_line.setValue(counts)
+        self.trig_line.show()
+
     def clear(self) -> None:
         self.frame = None
         self._dirty = False
@@ -194,6 +220,11 @@ class ScopeView(QtWidgets.QWidget):
             self.plot.setXRange(0, n * scale, padding=0)
         x = np.arange(n) * scale
         self.head.setRegion((0, f.head_skip * scale))
+        if f.waves and f.waves[0].time_ordered:     # hardware trigger at index 512
+            self.trig_mark.setValue(512 * scale)
+            self.trig_mark.show()
+        else:
+            self.trig_mark.hide()
         shown = set()
         meas = []
         self.peaks = {}

@@ -92,6 +92,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # control panel dock: one panel per tab
         self.panel = ScopePanel(worker)
         self.panel.channels_changed.connect(self.worker.set_channels)
+        self.panel.level_50.connect(self._level_50)
+        self.scope.level_dragged.connect(self.panel.set_level_counts)
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self.panel)
         self.stack.addWidget(_placeholder(PLACEHOLDER[1]))
@@ -378,10 +380,12 @@ class MainWindow(QtWidgets.QMainWindow):
         return labels.frame_notes(f, self.st, self.desc)
 
     def _update_scope_status(self) -> None:
+        self.scope.set_trigger_level(labels.trigger_counts(self.desc, self.st))
         f = self.scope.frame
         text = labels.scope_status(self.st, self.desc, f)
         self.sb_scope.setText(text)
-        warn = f is not None and any(n.startswith(("held record", "single record", "record taken"))
+        warn = f is not None and any(n.startswith(("held record", "single record", "record taken",
+                                                   "trigger level outside", "the unit triggers on CH1"))
                                      for n in self.frame_notes(f))
         self.sb_scope.setStyleSheet("color:#eb5757; font-weight:bold" if warn else "")
         tip = []
@@ -438,6 +442,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stats_f.flush()
 
     # ── user actions ───────────────────────────────────────────────
+    def _level_50(self) -> None:
+        f = self.scope.frame
+        rows = [i for i, c in enumerate(f.channels) if c == 0] if f is not None else []
+        if not rows:
+            self._note("Show CH1 to set the level from its signal")
+            return
+        body = f.samples[rows[0]][f.head_skip:]
+        self.panel.set_level_counts((int(body.min()) + int(body.max())) / 2)
+
     def _pause(self, on: bool) -> None:
         self.worker.paused = on
         self.act_pause.setText("Resume display" if on else "Pause display")

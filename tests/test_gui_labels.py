@@ -150,7 +150,7 @@ class FakeFrame:
     def __init__(self, tb=0x10, r1=7, rate=12490, tier="measured"):
         self.timebase_idx, self.sample_rate_hz, self.timebase_tier = tb, rate, tier
         self.waves = (proto.Waveform(1, 0, proto.WAVE_FLAG_TB_MEASURED, tb, r1, 1024, 24, rate,
-                                     26030850 if r1 == 7 else 12600000, 32, 24, bytes(1024)),)
+                                     26030850 if r1 == 7 else 12600000, 32, 24, bytes(range(256)) * 4),)
 
 
 class TestFrameNotes(unittest.TestCase):
@@ -167,6 +167,26 @@ class TestFrameNotes(unittest.TestCase):
         self.assertEqual(txt, "Running · 2.56 ms/div · 12.49 kS/s (measured)")
         txt = labels.scope_status(None, desc(), FakeFrame(tb=0x08, rate=0, tier="none"))
         self.assertIn("timebase not calibrated", txt)
+
+
+class TestTriggerNotes(unittest.TestCase):
+    def test_level_outside_the_ch1_signal(self):
+        f = FakeFrame()
+        f.waves = (proto.Waveform(1, 0, 0, 0x10, 7, 1024, 24, 12490, 26030850, 32, 24,
+                                  bytes([10, 100]) * 512),)               # CH1 10..100 counts
+        d = desc()
+        # level +21 fires at 126 counts: above the signal (the user's case, stage-087 run 3)
+        self.assertEqual(labels.trigger_counts(d, state(level=21)), 126)
+        self.assertIn("trigger level outside the CH1 signal", labels.frame_notes(f, state(level=21), d))
+        lv = labels.level_for_counts(d, 55)
+        self.assertEqual(labels.trigger_counts(d, state(level=lv)), 55)
+        self.assertNotIn("trigger level outside the CH1 signal", labels.frame_notes(f, state(level=lv), d))
+
+    def test_ch2_source_is_marked(self):
+        items = labels.source_items()
+        self.assertEqual([i.text for i in items], ["CH1", "CH2 (not working yet)"])
+        self.assertIn(labels.CH2_SOURCE_NOTE, labels.frame_notes(FakeFrame(), state(src=1), desc()))
+        self.assertIn("CH2 (not working yet)", labels.state_lines(state(src=1), desc())[3])
 
 
 class TestNotes(unittest.TestCase):

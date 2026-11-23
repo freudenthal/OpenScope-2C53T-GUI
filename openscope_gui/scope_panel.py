@@ -52,6 +52,7 @@ def fill_combo(cb: QtWidgets.QComboBox, items: List[labels.Item], current: Optio
 
 class ScopePanel(QtWidgets.QWidget):
     channels_changed = QtCore.Signal(int)       # display mask (bit0 CH1, bit1 CH2)
+    level_50 = QtCore.Signal()                  # "Level to 50 %": the window knows the record
 
     def __init__(self, worker, parent=None):
         super().__init__(parent)
@@ -112,10 +113,10 @@ class ScopePanel(QtWidgets.QWidget):
         self.tmode_cb = QtWidgets.QComboBox()
         self.tedge_cb = QtWidgets.QComboBox()
         self.tsrc_cb = QtWidgets.QComboBox()
-        for cb, words, what in ((self.tmode_cb, labels.TRIG_MODE_WORDS, "Trigger mode"),
-                                (self.tedge_cb, labels.TRIG_EDGE_WORDS, "Trigger edge"),
-                                (self.tsrc_cb, labels.TRIG_SOURCE_WORDS, "Trigger source")):
-            fill_combo(cb, labels.word_items(words, what), None)
+        for cb, items in ((self.tmode_cb, labels.word_items(labels.TRIG_MODE_WORDS, "Trigger mode")),
+                          (self.tedge_cb, labels.word_items(labels.TRIG_EDGE_WORDS, "Trigger edge")),
+                          (self.tsrc_cb, labels.source_items())):
+            fill_combo(cb, items, None)
             cb.activated.connect(self._send_trigger)
         self.level_sb = QtWidgets.QDoubleSpinBox()
         self.level_sb.setKeyboardTracking(False)
@@ -126,7 +127,14 @@ class ScopePanel(QtWidgets.QWidget):
         row.addWidget(self.tedge_cb, 2)
         row.addWidget(self.tsrc_cb, 1)
         f.addRow("Edge, source", row)
-        f.addRow("Level", self.level_sb)
+        self.level50_btn = QtWidgets.QPushButton("Level to 50 %")
+        self.level50_btn.setToolTip("Put the trigger level in the middle of the CH1 signal "
+                                    "(the unit fires on CH1)")
+        self.level50_btn.clicked.connect(self.level_50.emit)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.level_sb, 2)
+        row.addWidget(self.level50_btn, 1)
+        f.addRow("Level", row)
         v.addWidget(self.settings)
 
         self.state_lbl = QtWidgets.QLabel("Waiting for the unit")
@@ -189,8 +197,7 @@ class ScopePanel(QtWidgets.QWidget):
             self.probe_cb[i].setEnabled(s.probe is not None)
         fill_combo(self.tmode_cb, labels.word_items(labels.TRIG_MODE_WORDS, "Trigger mode"), s.trig_mode)
         fill_combo(self.tedge_cb, labels.word_items(labels.TRIG_EDGE_WORDS, "Trigger edge"), s.trig_edge)
-        fill_combo(self.tsrc_cb, labels.word_items(labels.TRIG_SOURCE_WORDS, "Trigger source"),
-                   s.trig_source)
+        fill_combo(self.tsrc_cb, labels.source_items(), s.trig_source)
         self._lscale = labels.level_scale(d, s)
         self._apply_level_scale()
         if not self.level_sb.hasFocus():        # never overwrite a level being typed
@@ -233,6 +240,17 @@ class ScopePanel(QtWidgets.QWidget):
             cb.blockSignals(True)
             cb.setChecked(bool(mask & (1 << i)))
             cb.blockSignals(False)
+
+    def set_level_counts(self, counts: float) -> None:
+        """Set the trigger level so the unit fires at `counts` (plot drag, Level to 50 %)."""
+        lv = labels.level_for_counts(self.desc, counts)
+        if lv is None or self.st is None:
+            return
+        self.level_sb.blockSignals(True)
+        self.level_sb.setValue(self._lscale.value(lv))
+        self.level_sb.blockSignals(False)
+        if lv != self.st.trig_level:
+            self._send_trigger()
 
     def level(self) -> int:
         return self._lscale.level(self.level_sb.value())
