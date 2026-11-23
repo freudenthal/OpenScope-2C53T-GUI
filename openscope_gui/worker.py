@@ -18,6 +18,14 @@ shows the state in force, never the value it asked for. A refusal is a failed
 job with the reason. Firmware without GET_SCOPE_STATE is noted once and not
 polled again until the next connect.
 
+Stage-087: at connect the worker asks once for the device description
+(GET_DESCRIPTION; `Device` caches it per connection) and emits it, or None
+for firmware without it. `set("probe", ch, f)` sets the probe. The window can
+choose the port (`set_port`, None = automatic) and go offline (`set_online`).
+`request_info()` collects the `openscope info` data for a dialog; `shell()`
+runs one debug-shell line, and refuses the I-40 commands (`cal restore`,
+`mem write`).
+
 NAKs are normal (NO_CAPTURE_DATA before the first capture, NOT_READY when no
 tear-free copy could be taken or the meter is blank — G-220, G-230): they are
 reported as notes and polled again. A lost port (unplug, reboot, IAP) drops
@@ -41,7 +49,15 @@ MODE_SCOPE, MODE_METER = 0, 1
 
 # set(what, *args) -> Device method (stage-085, the 080 control surface)
 SETTERS = {"mode": "set_mode", "timebase": "set_timebase", "vdiv": "set_vdiv",
-           "trigger": "set_trigger", "run": "run_stop"}
+           "trigger": "set_trigger", "run": "run_stop", "probe": "set_probe"}
+# I-40: never sent to the unit, whatever the user types in the debug console.
+FORBIDDEN_SHELL = ("cal restore", "mem write")
+
+
+def shell_refused(line: str) -> bool:
+    """True if `line` is an I-40 command (case and spacing ignored)."""
+    norm = " ".join(line.lower().split())
+    return any(norm == f or norm.startswith(f + " ") for f in FORBIDDEN_SHELL)
 
 
 @dataclass(frozen=True)
@@ -84,6 +100,10 @@ class Worker(QtCore.QThread):
     note = QtCore.Signal(str)               # a NAK or soft error, for the status bar
     job_done = QtCore.Signal(str, bool, str)  # job ("press"/"screenshot"/"set"), ok, message
     scope_state = QtCore.Signal(object)     # proto.ScopeState (with STATUS, and after each set)
+    description = QtCore.Signal(object)     # proto.Description at connect, or None (old firmware)
+    set_done = QtCore.Signal(str, bool)     # setting name, ok (after each set job)
+    info = QtCore.Signal(object)            # dict for the device information dialog
+    shell_out = QtCore.Signal(str, str)     # command, output (or the error text)
 
     MAX_TIMEOUTS = 3        # consecutive request timeouts before the link counts as lost
 
@@ -108,6 +128,9 @@ class Worker(QtCore.QThread):
         self._last_uc: Optional[int] = None
         self._timeouts = 0
         self.has_state: Optional[bool] = None   # None = not asked yet on this connection
+        self._need_desc = False
+        self.port: Optional[str] = None     # None = automatic (VID:PID); read by the opener
+        self.online = True                  # False = stay disconnected (Device > Disconnect)
         self.stats = {"frames": 0, "meter": 0, "naks": 0, "connects": 0, "losses": 0}
 
     # ── called from the GUI thread ────────────────────────────────
@@ -129,6 +152,25 @@ class Worker(QtCore.QThread):
         if what not in SETTERS:
             raise ValueError(f"unknown setting {what!r}; one of {', '.join(SETTERS)}")
         self._jobs.put(("set", (what, args)))
+
+    def set_probe(self, channel: int, factor: int) -> None:
+        self.set("probe", channel, factor)
+
+    def set_port(self, port: Optional[str]) -> None:
+        """Use this port from the next connect (None = automatic); reconnects now."""
+        self.port = port
+        self._jobs.put(("reconnect", None))
+
+    def set_online(self, on: bool) -> None:
+        self.online = on
+
+    def request_info(self) -> None:
+        self._jobs.put(("info", None))
+
+    def shell(self, line: str) -> None:
+        if shell_refused(line):
+            raise ValueError(f"'{line}' is never sent to the unit (I-40)")
+        self._jobs.put(("shell", line))
 
     def stop(self, wait_ms: int = 5000) -> bool:
         self._halt.set()
@@ -163,10 +205,17 @@ class Worker(QtCore.QThread):
         self.mode = None
 
     def step(self) -> None:
+        if not self.online:
+            if self.dev is not None:
+                self._drop(None)
+            self._fail_queued_jobs("disconnected by the user")
+            self._set_state("offline", "")
+            self._pause(self.retry_s)
+            return
         if self.dev is None:
             self._fail_queued_jobs("not connected")
             try:
-                self.dev = self._opener()
+                self.dev = self._opener(self.port) if self.port else self._opener()
             except Exception as e:          # NoDevice, busy port, version refusal
                 self._set_state("searching", str(e))
                 self._pause(self.retry_s)
@@ -174,9 +223,14 @@ class Worker(QtCore.QThread):
             self.stats["connects"] += 1
             self._last_status, self._last_fid, self._last_uc, self._timeouts = -1e9, None, None, 0
             self.has_state = None
+            self._need_desc = True
             self._set_state("connected", getattr(self.dev.link, "port", "") or "")
         try:
+            if self._need_desc:
+                self._get_description()
             self._run_jobs()
+            if self.dev is None:            # a reconnect job dropped the device
+                return
             if self._clock() - self._last_status >= self.status_s:
                 st = self.dev.status()
                 self._last_status = self._clock()
@@ -218,6 +272,24 @@ class Worker(QtCore.QThread):
         else:
             self._pause(self.idle_s)
 
+    def _get_description(self) -> None:
+        """Once per connection. A NAK means firmware before stage-086."""
+        fn = getattr(self.dev, "description", None)
+        if fn is None:
+            self._need_desc = False
+            self.description.emit(None)
+            return
+        try:
+            d = fn()
+        except Nak as e:
+            self._need_desc = False
+            self.note.emit(f"no device description on this firmware "
+                           f"({proto.ERRORS.get(e.code, hex(e.code))})")
+            self.description.emit(None)
+            return
+        self._need_desc = False
+        self.description.emit(d)
+
     def _poll_state(self) -> None:
         """SCOPE_STATE, unless this firmware has shown it has none."""
         if self.has_state is False:
@@ -248,6 +320,11 @@ class Worker(QtCore.QThread):
                 job, arg = self._jobs.get_nowait()
             except queue.Empty:
                 return
+            if job == "reconnect":
+                self._drop(None)
+                self._fail_queued_jobs("reconnecting")
+                self._set_state("searching", "port changed")
+                return
             try:
                 if job == "press":
                     self.dev.press(arg)
@@ -257,11 +334,26 @@ class Worker(QtCore.QThread):
                     self._screenshot_job(*arg)
                 elif job == "set":
                     what, args = arg
-                    getattr(self.dev, SETTERS[what])(*args)
+                    try:
+                        getattr(self.dev, SETTERS[what])(*args)
+                    except Exception:
+                        self.set_done.emit(what, False)
+                        raise
                     self.job_done.emit(job, True, f"{what} {' '.join(str(a) for a in args)}".strip())
+                    self.set_done.emit(what, True)
                     if what == "mode":
                         self._last_status = -1e9    # STATUS knows the mode first: poll now
                     self._poll_state()
+                elif job == "info":
+                    self._info_job()
+                elif job == "shell":
+                    try:
+                        out = self.dev.shell(arg, timeout=5.0)
+                    except Exception as e:
+                        self.shell_out.emit(arg, f"error: {e}")
+                        raise
+                    self.shell_out.emit(arg, out)
+                    self.job_done.emit(job, True, arg)
             except Nak as e:
                 name = proto.ERRORS.get(e.code, hex(e.code))
                 what = f"{arg[0]} " if job == "set" else ""
@@ -269,6 +361,20 @@ class Worker(QtCore.QThread):
             except (DeviceError, OSError) as e:
                 # Not a link loss by itself: the next STATUS poll decides that.
                 self.job_done.emit(job, False, f"{type(e).__name__}: {e}")
+
+    def _info_job(self) -> None:
+        version = self.dev.ping()
+        st = self.dev.status()
+        state = desc = None
+        if self.has_state:
+            state = self.dev.scope_state()
+        try:
+            desc = self.dev.description()
+        except Nak:
+            pass
+        self.info.emit({"version": version, "port": getattr(self.dev.link, "port", "") or "",
+                        "status": st, "state": state, "description": desc})
+        self.job_done.emit("info", True, "")
 
     def _screenshot_job(self, path: str, hold: bool) -> None:
         from ..screen import save_png
@@ -292,9 +398,15 @@ class Worker(QtCore.QThread):
     def _fail_queued_jobs(self, why: str) -> None:
         while True:
             try:
-                job, _ = self._jobs.get_nowait()
+                job, arg = self._jobs.get_nowait()
             except queue.Empty:
                 return
+            if job == "reconnect":
+                continue
+            if job == "set":
+                self.set_done.emit(arg[0], False)
+            if job == "shell":
+                self.shell_out.emit(arg, f"error: {why}")
             self.job_done.emit(job, False, why)
 
 

@@ -419,5 +419,137 @@ class TestWorker(unittest.TestCase):
         self.assertTrue(dev.closed)
 
 
+class DescDevice(FakeDevice):
+    """FakeDevice with the stage-086/087 methods."""
+
+    def __init__(self, desc=None, **kw):
+        super().__init__(**kw)
+        self.desc = desc
+        self.shell_lines = []
+
+    def description(self):
+        self.calls.append("description")
+        if isinstance(self.desc, BaseException):
+            raise self.desc
+        return self.desc
+
+    def set_probe(self, ch, factor):
+        self._set("set_probe", ch, factor, probe=(factor, 1) if ch == 1 else (10, factor))
+
+    def ping(self):
+        return "fake fw"
+
+    def shell(self, line, timeout=3.0):
+        self.shell_lines.append(line)
+        return f"out of {line}"
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6/numpy not installed (pip install -e .[gui])")
+class TestWorkerStage087(unittest.TestCase):
+    setUpClass = TestWorker.setUpClass
+    states = TestWorker.states
+
+    def setUp(self):
+        self.d = proto.Description(1, 32, ((12490, 2),), 32, (((42950, 2),),), None, (10, 1))
+
+    def test_description_once_per_connection(self):
+        dev = DescDevice(self.d)
+        w = self.make(Opener(dev))
+        for _ in range(3):
+            w.step()
+        self.assertEqual(dev.calls.count("description"), 1)
+        self.assertEqual(self.ev_desc, [self.d])
+
+    def test_old_firmware_description_is_none_and_noted(self):
+        dev = DescDevice(Nak(proto.CMD_GET_DESCRIPTION, 0x01))
+        w = self.make(Opener(dev))
+        w.step()
+        w.step()
+        self.assertEqual(self.ev_desc, [None])
+        self.assertTrue(any("no device description" in n for n in self.ev["note"]))
+        self.assertEqual(self.states(), ["connected"])
+
+    def test_probe_set_then_state(self):
+        dev = DescDevice(self.d)
+        w = self.make(Opener(dev))
+        w.step()
+        w.set_probe(1, 1)
+        w.step()
+        self.assertIn(("set_probe", 1, 1), dev.calls)
+        self.assertEqual(self.ev["state"][-1].probe, (1, 1))
+        self.assertIn(("probe", True), self.ev_set)
+
+    def test_failed_set_emits_set_done_false(self):
+        dev = DescDevice(self.d)
+        dev.set_error = Nak(proto.CMD_SET_MODE, 0x05)
+        w = self.make(Opener(dev))
+        w.step()
+        w.set("mode", "meter")
+        w.step()
+        self.assertEqual(self.ev_set, [("mode", False)])
+
+    def test_offline_drops_and_fails_jobs(self):
+        dev = DescDevice(self.d)
+        w = self.make(Opener(dev))
+        w.step()
+        w.set_online(False)
+        w.set("run", False)
+        w.step()
+        self.assertTrue(dev.closed)
+        self.assertEqual(self.states(), ["connected", "offline"])
+        self.assertEqual(self.ev_set, [("run", False)])
+        w.set_online(True)
+        w.step()
+        self.assertEqual(self.states()[-1], "connected")
+
+    def test_set_port_reconnects_with_the_port(self):
+        got = []
+        dev = DescDevice(self.d)
+
+        def opener(port=None):
+            got.append(port)
+            return dev
+        w = self.make(opener)
+        w.step()
+        w.set_port("COM9")
+        w.step()
+        w.step()
+        self.assertEqual(got, [None, "COM9"])
+
+    def test_info_job(self):
+        dev = DescDevice(self.d)
+        w = self.make(Opener(dev))
+        w.step()
+        got = []
+        w.info.connect(got.append)
+        w.request_info()
+        w.step()
+        self.assertEqual(got[0]["version"], "fake fw")
+        self.assertEqual(got[0]["description"], self.d)
+        self.assertIsNotNone(got[0]["state"])
+
+    def test_shell_job_and_i40_refusal(self):
+        dev = DescDevice(self.d)
+        w = self.make(Opener(dev))
+        out = []
+        w.shell_out.connect(lambda c, t: out.append((c, t)))
+        w.step()
+        w.shell("version")
+        with self.assertRaises(ValueError):
+            w.shell("mem write 0x20000000 0")
+        with self.assertRaises(ValueError):
+            w.shell("cal restore")
+        w.step()
+        self.assertEqual(dev.shell_lines, ["version"])
+        self.assertEqual(out, [("version", "out of version")])
+
+    def make(self, opener, **kw):
+        w = TestWorker.make(self, opener, **kw)
+        self.ev_desc, self.ev_set = [], []
+        w.description.connect(self.ev_desc.append)
+        w.set_done.connect(lambda what, ok: self.ev_set.append((what, ok)))
+        return w
+
+
 if __name__ == "__main__":
     unittest.main()
