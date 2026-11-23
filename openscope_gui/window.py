@@ -21,7 +21,7 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import proto
+from openscope import proto
 from . import dialogs, labels
 from .scope_panel import ScopePanel, continuous
 from .views import MeterView, Rate, ScopeView
@@ -467,7 +467,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_disconnect.setEnabled(on)
 
     def _fill_ports(self) -> None:
-        from ..link import candidate_ports
+        from openscope.link import candidate_ports
         self.port_menu.clear()
         for a in self.port_group.actions():
             self.port_group.removeAction(a)
@@ -525,7 +525,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_waveform(self, path: str, flt: str = "") -> str:
         """CSV or NPZ by the file type (the extension, else the chosen filter)."""
-        from ..cli import write_capture_csv, write_capture_npz
+        from openscope.cli import write_capture_csv, write_capture_npz
         ext = os.path.splitext(path)[1].lower()
         if ext not in (".csv", ".npz"):
             ext = ".npz" if "npz" in flt else ".csv"

@@ -42,8 +42,8 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 from PySide6 import QtCore
 
-from .. import proto
-from ..device import Device, DeviceError, Nak, Timeout
+from openscope import proto
+from openscope.device import Device, DeviceError, Nak, Timeout
 
 MODE_SCOPE, MODE_METER = 0, 1
 
@@ -377,7 +377,7 @@ class Worker(QtCore.QThread):
         self.job_done.emit("info", True, "")
 
     def _screenshot_job(self, path: str, hold: bool) -> None:
-        from ..screen import save_png
+        from openscope.screen import save_png
         held = False
         try:
             if hold and self.has_state:

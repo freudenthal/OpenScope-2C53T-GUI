@@ -10,7 +10,8 @@ import tempfile
 import time
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _paths  # noqa: E402,F401  (this repo and the openscope library)
 from openscope import proto  # noqa: E402
 from openscope.device import DeviceError, Nak, Screen, Timeout  # noqa: E402
 from openscope.link import NoDevice  # noqa: E402
@@ -18,7 +19,7 @@ from openscope.link import NoDevice  # noqa: E402
 try:
     from PySide6 import QtCore
     import numpy as np
-    from openscope.gui.worker import ScopeFrame, Worker  # noqa: E402
+    from openscope_gui.worker import ScopeFrame, Worker  # noqa: E402
     HAVE_QT = True
 except ImportError:          # pragma: no cover - depends on the venv
     HAVE_QT = False

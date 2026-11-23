@@ -19,7 +19,7 @@ from typing import List, Optional
 
 from PySide6 import QtCore, QtWidgets
 
-from .. import proto
+from openscope import proto
 from . import labels
 
 TIP = QtCore.Qt.ToolTipRole

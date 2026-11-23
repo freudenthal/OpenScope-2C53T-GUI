@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
-from .. import proto
+from openscope import proto
 
 MODE_WORDS = {0: "Oscilloscope", 1: "Multimeter", 2: "Signal generator", 3: "Settings"}
 TRIG_MODE_WORDS = {0: "Auto", 1: "Normal", 2: "Single"}

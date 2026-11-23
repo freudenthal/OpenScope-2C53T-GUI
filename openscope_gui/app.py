@@ -14,7 +14,7 @@ import sys
 
 from PySide6 import QtCore, QtWidgets
 
-from .. import proto
+from openscope import proto
 from .window import KEYS, MainWindow  # noqa: F401  (re-exported for scripts)
 from .worker import Worker
 
@@ -30,7 +30,7 @@ def main(argv=None) -> int:
     p.add_argument("--grab-after", type=float, default=10.0)
     p.add_argument("--quit-after", type=float, metavar="S", help="close after S seconds (bench)")
     a = p.parse_args(argv)
-    from ..device import Device
+    from openscope.device import Device
     import pyqtgraph as pg
     pg.setConfigOptions(antialias=False, foreground="#dddddd", background="#1e1e1e")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])

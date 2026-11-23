@@ -82,7 +82,8 @@ class DebugConsoleDialog(QtWidgets.QDialog):
 
 
 def about_text(firmware: str) -> str:
-    from .. import __version__ as lib
+    from openscope import __version__ as lib
+    from . import __version__ as gui
     try:
         import PySide6
         qt = PySide6.__version__
@@ -94,7 +95,7 @@ def about_text(firmware: str) -> str:
     except Exception:                       # pragma: no cover
         pg = "?"
     py = ".".join(str(x) for x in sys.version_info[:3])
-    rows = [("OpenScope GUI", lib), ("openscope library", lib),
+    rows = [("OpenScope GUI", gui), ("openscope library", lib),
             ("Firmware", firmware or "not connected"),
             ("PySide6", qt), ("pyqtgraph", pg), ("Python", py)]
     body = "".join(f"<tr><td>{html.escape(a)}</td><td>&nbsp;{html.escape(b)}</td></tr>" for a, b in rows)

@@ -9,9 +9,10 @@ import re
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _paths  # noqa: E402,F401  (this repo and the openscope library)
 from openscope import proto  # noqa: E402
-from openscope.gui import labels  # noqa: E402
+from openscope_gui import labels  # noqa: E402
 
 # GET_DESCRIPTION reply payload, 239 B, from the unit (stage-087 step 1).
 REAL_DESCRIPTION = bytes.fromhex(

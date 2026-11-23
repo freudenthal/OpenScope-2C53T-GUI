@@ -10,14 +10,15 @@ import tempfile
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _paths  # noqa: E402,F401  (this repo and the openscope library)
 from openscope import proto  # noqa: E402
 
 try:
     import numpy as np
     from PySide6 import QtWidgets
-    from openscope.gui import views  # noqa: E402
-    from openscope.gui.worker import MeterSample, ScopeFrame  # noqa: E402
+    from openscope_gui import views  # noqa: E402
+    from openscope_gui.worker import MeterSample, ScopeFrame  # noqa: E402
     HAVE_QT = True
 except ImportError:          # pragma: no cover - depends on the venv
     HAVE_QT = False
