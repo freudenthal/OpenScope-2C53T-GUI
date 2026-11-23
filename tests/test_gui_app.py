@@ -169,7 +169,7 @@ class TestScopePanel(WindowCase):
         self.assertEqual(p.level_sb.suffix(), " V")
         self.assertEqual(p.level(), -40)
         self.assertEqual(p.run_btn.text(), "Run")
-        self.assertIn("Stopped", p.state_lbl.text())
+        self.assertIn("Single capture", p.state_lbl.text())      # trigger Single: not "Stopped"
         self.assertEqual(self.jobs(), [])
 
     def test_each_user_change_queues_exactly_one_set(self):
@@ -190,6 +190,40 @@ class TestScopePanel(WindowCase):
         self.win.panel.single_btn.click()
         self.assertEqual(self.jobs(), [("set", ("trigger", ("single", "falling", "CH2", 12))),
                                        ("set", ("run", (True,)))])
+
+    def test_run_after_single_returns_to_continuous(self):
+        """After Single the unit reports running while it holds one record; Run must
+        put the previous trigger mode back, not re-arm another single (user report)."""
+        self.connect(st=state(tmode=0, level=29))
+        p = self.win.panel
+        self.assertEqual(p.run_btn.text(), "Stop")
+        p.single_btn.click()
+        self.jobs()
+        self.win._scope_state(state(running=True, tmode=2, level=29))
+        self.assertEqual(p.run_btn.text(), "Run")
+        self.assertIn("Single capture", p.state_lbl.text())
+        p.run_btn.click()
+        self.assertEqual(self.jobs(), [("set", ("trigger", ("auto", "rising", "CH1", 29))),
+                                       ("set", ("run", (True,)))])
+        self.win._scope_state(state(running=True, tmode=0, level=29))
+        self.assertEqual(p.run_btn.text(), "Stop")
+
+    def test_run_after_single_restores_normal(self):
+        self.connect(st=state(tmode=1))
+        self.win._scope_state(state(running=False, tmode=2))         # single, then stopped
+        self.win.act_run.trigger()                                   # toolbar / Space: same path
+        self.assertEqual(self.jobs(), [("set", ("trigger", ("normal", "rising", "CH1", 0))),
+                                       ("set", ("run", (True,)))])
+
+    def test_unit_already_in_single_resumes_auto(self):
+        self.connect(st=state(tmode=2))
+        self.win.panel.run_btn.click()
+        self.assertEqual(self.jobs()[0], ("set", ("trigger", ("auto", "rising", "CH1", 0))))
+
+    def test_single_record_note(self):
+        self.connect(st=state(tmode=2))
+        self.win._frame(frame())
+        self.assertIn("single record", self.win.sb_scope.text())
 
     def test_level_in_volts_sent_only_when_it_changed(self):
         self.connect(st=state(level=10))

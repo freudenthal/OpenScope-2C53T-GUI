@@ -234,6 +234,8 @@ def channel_words(state: proto.ScopeState, i: int) -> str:
 
 
 def run_words(state: proto.ScopeState) -> str:
+    if state.trig_mode == 2:        # Single: "running" on the unit means armed or holding
+        return "Single capture (Run returns to continuous)"
     return "Running" if state.running else "Stopped (held record)"
 
 
@@ -279,7 +281,9 @@ def frame_notes(frame, state: Optional[proto.ScopeState], desc: Optional[proto.D
         notes.append("rate withheld: the unit's screen shows another timebase")
     if state is None:
         return notes
-    if not state.running:
+    if state.trig_mode == 2:
+        notes.insert(0, "single record")
+    elif not state.running:
         notes.insert(0, "held record")
     diffs = []
     if frame.timebase_idx != state.timebase_code:

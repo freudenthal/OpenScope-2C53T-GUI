@@ -23,7 +23,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import proto
 from . import dialogs, labels
-from .scope_panel import ScopePanel
+from .scope_panel import ScopePanel, continuous
 from .views import MeterView, Rate, ScopeView
 from .worker import ScopeFrame, Worker
 
@@ -366,7 +366,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.set_state(s)
         self._actions_enabled(True)
         self.act_run.setIcon(self.style().standardIcon(
-            QtWidgets.QStyle.SP_MediaPause if s.running else QtWidgets.QStyle.SP_MediaPlay))
+            QtWidgets.QStyle.SP_MediaPause if continuous(s) else QtWidgets.QStyle.SP_MediaPlay))
         self._follow_mode(s.mode)
         self._update_scope_status()
 
@@ -381,7 +381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f = self.scope.frame
         text = labels.scope_status(self.st, self.desc, f)
         self.sb_scope.setText(text)
-        warn = f is not None and any(n.startswith(("held record", "record taken"))
+        warn = f is not None and any(n.startswith(("held record", "single record", "record taken"))
                                      for n in self.frame_notes(f))
         self.sb_scope.setStyleSheet("color:#eb5757; font-weight:bold" if warn else "")
         tip = []

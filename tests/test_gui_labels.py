@@ -134,6 +134,12 @@ class TestStateWords(unittest.TestCase):
         self.assertEqual(lines[1], "CH1 26 V/div (probe ×10, measured)")
         self.assertTrue(lines[3].startswith("Trigger Auto · Rising edge · CH1 · level +"))
 
+    def test_single_in_words(self):
+        s = proto.ScopeState(1, 0, True, 0x10, 0x10, 2, 2, 0, 0, 0, 12490, 0x80, 32, state().ch, (10, 1))
+        self.assertTrue(labels.state_lines(s, desc())[0].startswith("Single capture (Run returns to continuous)"))
+        self.assertTrue(labels.scope_status(s, desc()).startswith("Single capture · 2.56 ms/div"))
+        self.assertEqual(labels.frame_notes(FakeFrame(), s, desc())[0], "single record")
+
     def test_stopped_and_uncalibrated(self):
         s = state(running=False, tb=0x08, tier=0, rate=0)
         line = labels.state_lines(s, desc())[0]

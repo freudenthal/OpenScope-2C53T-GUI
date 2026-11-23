@@ -6,6 +6,12 @@ anything: combos act on `activated` (user only), the level on
 `editingFinished` (user only), and a state update never sends a set
 (stage-085 rule). Every combo item is a practical value or a word; the code
 is in the item's tooltip (labels.py).
+
+Single is a trigger mode on the unit: after Single the unit reports
+"running" while it waits for, or holds, its one record. So the Run/Stop
+button counts trigger Single as not running: it shows "Run", and Run puts
+back the trigger mode in force before Single (Auto if none was seen) and
+runs. Without that, Run/Stop only re-armed another single capture.
 """
 from __future__ import annotations
 
@@ -17,6 +23,12 @@ from .. import proto
 from . import labels
 
 TIP = QtCore.Qt.ToolTipRole
+SINGLE = 2                                      # proto.TRIG_MODES[2]
+
+
+def continuous(s: proto.ScopeState) -> bool:
+    """Running and not in trigger Single (Single holds its record while 'running')."""
+    return s.running and s.trig_mode != SINGLE
 
 
 def fill_combo(cb: QtWidgets.QComboBox, items: List[labels.Item], current: Optional[int]) -> None:
@@ -47,6 +59,7 @@ class ScopePanel(QtWidgets.QWidget):
         self.st: Optional[proto.ScopeState] = None
         self.desc: Optional[proto.Description] = None
         self.show_uncalibrated = False
+        self.resume_mode = 0                    # trigger mode that Run restores after Single
         self._lscale = labels.level_scale(None, None)
 
         v = QtWidgets.QVBoxLayout(self)
@@ -144,6 +157,8 @@ class ScopePanel(QtWidgets.QWidget):
 
     def set_state(self, s: proto.ScopeState) -> None:
         self.st = s
+        if s.trig_mode != SINGLE:
+            self.resume_mode = s.trig_mode
         self.set_enabled(True)
         self.refresh()
 
@@ -156,9 +171,14 @@ class ScopePanel(QtWidgets.QWidget):
                 fill_combo(cb, labels.vdiv_items(d, i + 1, d.probe_factor(i + 1) if d else 1,
                                                  self.show_uncalibrated), None)
             return
-        self.run_btn.setText("Stop" if s.running else "Run")
-        self.run_btn.setStyleSheet("" if s.running else
+        cont = continuous(s)
+        self.run_btn.setText("Stop" if cont else "Run")
+        self.run_btn.setStyleSheet("" if cont else
                                    "background:#eb5757; color:white; font-weight:bold")
+        self.run_btn.setToolTip(
+            "Stop the acquisition (Space)" if cont else
+            f"Continuous capture, trigger {labels.TRIG_MODE_WORDS[self.resume_mode]} (Space)"
+            if s.trig_mode == SINGLE else "Run the acquisition (Space)")
         fill_combo(self.tb_cb, labels.timebase_items(d, self.show_uncalibrated, s.timebase_code),
                    s.timebase_code)
         for i, cb in enumerate(self.vdiv_cb):
@@ -182,8 +202,15 @@ class ScopePanel(QtWidgets.QWidget):
 
     # ── user actions ───────────────────────────────────────────────
     def toggle_run(self) -> None:
-        if self.st is not None:
-            self.worker.set("run", not self.st.running)
+        s = self.st
+        if s is None:
+            return
+        if s.trig_mode == SINGLE:               # back to continuous capture
+            self.worker.set("trigger", proto.TRIG_MODES[self.resume_mode], proto.TRIG_EDGES[s.trig_edge],
+                            proto.TRIG_SOURCES[s.trig_source], s.trig_level)
+            self.worker.set("run", True)
+        else:
+            self.worker.set("run", not s.running)
 
     def single(self) -> None:
         """Trigger mode Single, then run: the unit takes one record and holds it."""
