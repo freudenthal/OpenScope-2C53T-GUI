@@ -128,8 +128,8 @@ class ScopePanel(QtWidgets.QWidget):
         row.addWidget(self.tsrc_cb, 1)
         f.addRow("Edge, source", row)
         self.level50_btn = QtWidgets.QPushButton("Level to 50 %")
-        self.level50_btn.setToolTip("Put the trigger level in the middle of the CH1 signal "
-                                    "(the unit fires on CH1)")
+        self.level50_btn.setToolTip("Put the trigger level in the middle of the trigger "
+                                    "source's signal")
         self.level50_btn.clicked.connect(self.level_50.emit)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.level_sb, 2)

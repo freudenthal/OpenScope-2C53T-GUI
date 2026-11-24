@@ -147,7 +147,7 @@ class ScopeView(QtWidgets.QWidget):
                                          pen=pg.mkPen(CH_COLORS[0], width=1, style=QtCore.Qt.DashLine),
                                          hoverPen=pg.mkPen("#ffffff", width=2),
                                          label="Trigger", labelOpts={"position": 0.03, "color": CH_COLORS[0]})
-        self.trig_line.setToolTip("Trigger level (drag to change). The unit fires on CH1.")
+        self.trig_line.setToolTip("Trigger level (drag to change), compared with the trigger source.")
         self.trig_line.sigPositionChangeFinished.connect(lambda ln: self.level_dragged.emit(ln.value()))
         self.trig_line.hide()
         self.plot.addItem(self.trig_line)

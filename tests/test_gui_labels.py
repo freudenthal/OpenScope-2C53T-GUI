@@ -183,11 +183,36 @@ class TestTriggerNotes(unittest.TestCase):
         self.assertEqual(labels.trigger_counts(d, state(level=lv)), 55)
         self.assertNotIn("trigger level outside the CH1 signal", labels.frame_notes(f, state(level=lv), d))
 
-    def test_ch2_source_is_marked(self):
+    def test_ch2_source_works(self):
+        # stage-091 (G-320 closed): CH2 is a plain, measured item; no warning note
+        self.assertTrue(labels.CH2_TRIGGER_WORKS)
         items = labels.source_items()
-        self.assertEqual([i.text for i in items], ["CH1", "CH2 (not working yet)"])
-        self.assertIn(labels.CH2_SOURCE_NOTE, labels.frame_notes(FakeFrame(), state(src=1), desc()))
-        self.assertIn("CH2 (not working yet)", labels.state_lines(state(src=1), desc())[3])
+        self.assertEqual([i.text for i in items], ["CH1", "CH2"])
+        self.assertEqual(items[1].tier, "measured")
+        self.assertNotIn(labels.CH2_SOURCE_NOTE, labels.frame_notes(FakeFrame(), state(src=1), desc()))
+        self.assertNotIn("not working", labels.state_lines(state(src=1), desc())[3])
+        self.assertEqual((labels.trigger_channel(state(src=0)), labels.trigger_channel(state(src=1))), (0, 1))
+
+    def test_ch2_source_marked_on_an_older_image(self):
+        labels.CH2_TRIGGER_WORKS = False
+        try:
+            self.assertEqual([i.text for i in labels.source_items()], ["CH1", "CH2 (not working yet)"])
+            self.assertIn(labels.CH2_SOURCE_NOTE, labels.frame_notes(FakeFrame(), state(src=1), desc()))
+            self.assertIn("CH2 (not working yet)", labels.state_lines(state(src=1), desc())[3])
+            self.assertEqual(labels.trigger_channel(state(src=1)), 0)
+        finally:
+            labels.CH2_TRIGGER_WORKS = True
+
+    def test_level_outside_the_ch2_signal(self):
+        f = FakeFrame()
+        f.waves = (proto.Waveform(1, 0, 0, 0x10, 7, 1024, 24, 12490, 26030850, 32, 24, bytes([10, 100]) * 512),
+                   proto.Waveform(1, 1, 0, 0x10, 7, 1024, 24, 12490, 2466778, 32, 24, bytes([112, 198]) * 512))
+        d = desc()
+        lv1 = labels.level_for_counts(d, 55)                   # inside CH1, below CH2
+        lv2 = labels.level_for_counts(d, 155)                  # inside CH2, above CH1
+        self.assertIn("trigger level outside the CH2 signal", labels.frame_notes(f, state(src=1, level=lv1), d))
+        self.assertEqual([n for n in labels.frame_notes(f, state(src=1, level=lv2), d) if "outside" in n], [])
+        self.assertIn("trigger level outside the CH1 signal", labels.frame_notes(f, state(src=0, level=lv2), d))
 
 
 class TestNotes(unittest.TestCase):

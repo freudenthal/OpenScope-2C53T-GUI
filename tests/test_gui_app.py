@@ -166,7 +166,7 @@ class TestScopePanel(WindowCase):
         self.assertEqual(p.vdiv_cb[1].currentText(), "617 mV/div")
         self.assertEqual(p.probe_cb[0].currentText(), "×10")
         self.assertEqual((p.tmode_cb.currentText(), p.tedge_cb.currentText(), p.tsrc_cb.currentText()),
-                         ("Single", "Falling edge", "CH2 (not working yet)"))
+                         ("Single", "Falling edge", "CH2"))
         self.assertEqual(p.level_sb.suffix(), " V")
         self.assertEqual(p.level(), -40)
         self.assertEqual(p.run_btn.text(), "Run")
@@ -243,6 +243,26 @@ class TestScopePanel(WindowCase):
         self.win.panel.level50_btn.click()
         self.assertEqual(self.jobs(), [])
         self.assertIn("Show CH1", self.win.sb_note.text())
+
+    def test_level_50_follows_the_ch2_source(self):
+        # stage-091: with source CH2 the unit compares CH2, so 50 % is the CH2 middle
+        self.connect(st=state(src=1, level=0))
+        w1 = proto.Waveform(9, 0, 0, 0x10, 7, 1024, 24, 12490, 26030850, 32, 24, bytes([10, 100]) * 512)
+        w2 = proto.Waveform(9, 1, 0, 0x10, 7, 1024, 24, 12490, 2466778, 32, 24, bytes([112, 198]) * 512)
+        self.win._frame(ScopeFrame.from_waves((w1, w2), 0.0))
+        self.win.panel.level50_btn.click()
+        jobs = self.jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0][1][1][:3], ("auto", "rising", "CH2"))
+        self.assertEqual(self.desc.trigger.record_counts(jobs[0][1][1][3]), 155)
+        self.assertEqual(self.win.panel.tsrc_cb.currentText(), "CH2")
+
+    def test_level_50_with_ch2_source_needs_ch2(self):
+        self.connect(st=state(src=1))
+        self.win._frame(frame())                               # CH1 only
+        self.win.panel.level50_btn.click()
+        self.assertEqual(self.jobs(), [])
+        self.assertIn("Show CH2", self.win.sb_note.text())
 
     def test_single_record_note(self):
         self.connect(st=state(tmode=2))

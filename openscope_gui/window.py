@@ -444,9 +444,10 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── user actions ───────────────────────────────────────────────
     def _level_50(self) -> None:
         f = self.scope.frame
-        rows = [i for i, c in enumerate(f.channels) if c == 0] if f is not None else []
+        src = labels.trigger_channel(self.st)
+        rows = [i for i, c in enumerate(f.channels) if c == src] if f is not None else []
         if not rows:
-            self._note("Show CH1 to set the level from its signal")
+            self._note(f"Show CH{src + 1} to set the level from its signal")
             return
         body = f.samples[rows[0]][f.head_skip:]
         self.panel.set_level_counts((int(body.min()) + int(body.max())) / 2)

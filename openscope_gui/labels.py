@@ -27,11 +27,11 @@ MODE_WORDS = {0: "Oscilloscope", 1: "Multimeter", 2: "Signal generator", 3: "Set
 TRIG_MODE_WORDS = {0: "Auto", 1: "Normal", 2: "Single"}
 TRIG_EDGE_WORDS = {0: "Rising edge", 1: "Falling edge"}
 TRIG_SOURCE_WORDS = {0: "CH1", 1: "CH2"}
-# Stage-087 bench (run 3): guest-coldtrace fires on CH1 whatever the source
-# setting (source CH2 with the level at the CH1 middle triggers as often as
-# source CH1; level at the CH2 middle: no records). Set True when a firmware
-# makes the CH2 source work (G-320).
-CH2_TRIGGER_WORKS = False
+# Stage-087 bench (run 3): guest-coldtrace before stage-091 fired on CH1
+# whatever the source (G-320). Stage-091 (firmware 80565ab, reg 0x06): source
+# CH2 fires on CH2 only (Normal, 4 s: level at the CH2 middle 14 / 4 records at
+# 0x0F / 0x12, level at the CH1 middle 0 / 0). False marks CH2 for an older image.
+CH2_TRIGGER_WORKS = True
 CH2_SOURCE_NOTE = "the unit triggers on CH1 only (CH2 source does not work yet)"
 TIER_WORDS = {"measured": "measured", "provisional": "provisional", "none": "not calibrated"}
 SCREEN_COUNTS = 256             # ADC span of the screen height (8 bit record)
@@ -299,6 +299,14 @@ def state_lines(state: proto.ScopeState, desc: Optional[proto.Description]) -> L
             trigger_words(state, desc)]
 
 
+def trigger_channel(state: Optional[proto.ScopeState]) -> int:
+    """The channel (0 = CH1, 1 = CH2) whose record the unit compares with the
+    level: the trigger source, or CH1 on a firmware where CH2 does not work."""
+    if state is not None and state.trig_source == 1 and CH2_TRIGGER_WORKS:
+        return 1
+    return 0
+
+
 def frame_notes(frame, state: Optional[proto.ScopeState], desc: Optional[proto.Description]) -> List[str]:
     """Trust notes for a shown frame against the state in force, in words.
     `frame` is a gui.worker.ScopeFrame (duck-typed: timebase_idx, waves,
@@ -313,11 +321,12 @@ def frame_notes(frame, state: Optional[proto.ScopeState], desc: Optional[proto.D
     if state is None:
         return notes
     fire = trigger_counts(desc, state)
-    ch1 = [w for w in frame.waves if w.channel == 0]
-    if fire is not None and ch1:
-        body = ch1[0].samples[ch1[0].head_skip:]
+    src = trigger_channel(state)
+    shown = [w for w in frame.waves if w.channel == src]
+    if fire is not None and shown:
+        body = shown[0].samples[shown[0].head_skip:]
         if body and not (min(body) < fire <= max(body)):
-            notes.append("trigger level outside the CH1 signal")
+            notes.append(f"trigger level outside the CH{src + 1} signal")
     if state.trig_source == 1 and not CH2_TRIGGER_WORKS:
         notes.append(CH2_SOURCE_NOTE)
     if state.trig_mode == 2:
