@@ -95,7 +95,10 @@ class Rate:
         self.t: deque = deque()
 
     def tick(self, now: Optional[float] = None) -> None:
-        self.t.append(time.monotonic() if now is None else now)
+        now = time.monotonic() if now is None else now
+        self.t.append(now)
+        while now - self.t[0] > self.window:    # bounded without value() calls
+            self.t.popleft()
 
     def value(self, now: Optional[float] = None) -> float:
         now = time.monotonic() if now is None else now

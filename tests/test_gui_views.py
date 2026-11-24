@@ -80,6 +80,15 @@ class TestAnalysis(unittest.TestCase):
         self.assertAlmostEqual(r.value(1.0), 10.0, places=6)
         self.assertEqual(r.value(10.0), 0.0)
 
+    def test_rate_stays_bounded_without_value(self):
+        # code review 2026-11-23 Q-2: the window ticks every 33 ms and reads value()
+        # only with --stats; tick() alone must drop old entries.
+        r = views.Rate(2.0)
+        for i in range(10000):
+            r.tick(i * 0.04)                    # 25 per second for 400 s
+        self.assertLessEqual(len(r.t), 2.0 * 25 + 2)
+        self.assertAlmostEqual(r.value(9999 * 0.04), 25.0, places=6)
+
 
 @unittest.skipUnless(HAVE_QT, "PySide6/numpy/pyqtgraph not installed (pip install -e .[gui])")
 class TestViews(unittest.TestCase):

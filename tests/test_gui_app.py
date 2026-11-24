@@ -19,7 +19,7 @@ from openscope import proto  # noqa: E402
 
 try:
     import numpy as np  # noqa: F401
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtTest, QtWidgets
     from openscope_gui.app import MainWindow  # noqa: E402
     from openscope_gui.window import SETTINGS_BANNER  # noqa: E402
     from openscope_gui.worker import ScopeFrame, Worker, shell_refused  # noqa: E402
@@ -277,6 +277,46 @@ class TestScopePanel(WindowCase):
         p.level_sb.setValue(p._lscale.value(-25))
         p.level_sb.editingFinished.emit()
         self.assertEqual(self.jobs(), [("set", ("trigger", ("auto", "rising", "CH1", -25)))])
+
+    def test_typed_level_survives_state_updates(self):
+        # code review 2026-11-23 Q-1: each SCOPE_STATE (about 2 per second) set the
+        # box's decimals/step/range/suffix, and Qt wrote the text again from the
+        # stored value, so a typed level was lost before Enter.
+        self.connect(st=state(level=10))
+        p, sb = self.win.panel, self.win.panel.level_sb
+        self.win.activateWindow()
+        sb.setFocus()
+        self.app.processEvents()
+        self.assertTrue(sb.hasFocus())
+        typed = f"{p._lscale.value(-25):.{sb.decimals()}f}"
+        sb.selectAll()
+        QtTest.QTest.keyClicks(sb, typed)
+        self.assertEqual(sb.cleanText(), typed)
+        self.win._scope_state(state(level=10))                  # same scale
+        self.assertEqual(sb.cleanText(), typed)
+        self.win._scope_state(state(level=10, r1=6))            # CH1 range changed: new scale
+        self.assertEqual(sb.cleanText(), typed)
+        self.assertEqual(self.jobs(), [])
+        QtTest.QTest.keyClick(sb, QtCore.Qt.Key_Return)         # editing finished
+        want = p._lscale.level(float(typed))                    # volts on the range now in force
+        self.assertEqual(self.jobs(), [("set", ("trigger", ("auto", "rising", "CH1", want)))])
+        self.assertEqual(sb.suffix(), " V")
+        self.assertAlmostEqual(sb.value(), p._lscale.value(want), places=sb.decimals())
+
+    def test_focus_out_without_typing_sends_nothing(self):
+        # Q-1 follow-on: the range changes while the box has the focus; leaving the box
+        # without an edit must not read the old volts on the new range and send a set.
+        self.connect(st=state(level=10))
+        p, sb = self.win.panel, self.win.panel.level_sb
+        self.win.activateWindow()
+        sb.setFocus()
+        self.app.processEvents()
+        self.assertTrue(sb.hasFocus())
+        self.win._scope_state(state(level=10, r1=6))
+        sb.editingFinished.emit()
+        self.assertEqual(self.jobs(), [])
+        self.assertEqual(p.level(), 10)
+        self.assertAlmostEqual(sb.value(), p._lscale.value(10), places=sb.decimals())
 
     def test_uncalibrated_items_hidden_by_default(self):
         self.connect()

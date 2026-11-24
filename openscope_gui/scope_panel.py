@@ -61,7 +61,10 @@ class ScopePanel(QtWidgets.QWidget):
         self.desc: Optional[proto.Description] = None
         self.show_uncalibrated = False
         self.resume_mode = 0                    # trigger mode that Run restores after Single
-        self._lscale = labels.level_scale(None, None)
+        self._lscale = labels.level_scale(None, None)   # scale in force (latest state)
+        self._shown: Optional[labels.LevelScale] = None  # scale the level box shows
+        self._shown_level: Optional[int] = None          # level last put in the box
+        self._shown_value = 0.0                          # box value for it (after rounding)
 
         v = QtWidgets.QVBoxLayout(self)
         # acquisition
@@ -199,11 +202,8 @@ class ScopePanel(QtWidgets.QWidget):
         fill_combo(self.tedge_cb, labels.word_items(labels.TRIG_EDGE_WORDS, "Trigger edge"), s.trig_edge)
         fill_combo(self.tsrc_cb, labels.source_items(), s.trig_source)
         self._lscale = labels.level_scale(d, s)
-        self._apply_level_scale()
         if not self.level_sb.hasFocus():        # never overwrite a level being typed
-            self.level_sb.blockSignals(True)
-            self.level_sb.setValue(self._lscale.value(s.trig_level))
-            self.level_sb.blockSignals(False)
+            self._show_level(s.trig_level)
         self.level_sb.setToolTip(labels.level_tooltip(s))
         self.state_lbl.setText("\n".join(labels.state_lines(s, d)))
 
@@ -246,26 +246,51 @@ class ScopePanel(QtWidgets.QWidget):
         lv = labels.level_for_counts(self.desc, counts)
         if lv is None or self.st is None:
             return
-        self.level_sb.blockSignals(True)
-        self.level_sb.setValue(self._lscale.value(lv))
-        self.level_sb.blockSignals(False)
+        self._show_level(lv)
         if lv != self.st.trig_level:
-            self._send_trigger()
+            self._send_trigger(level=lv)
 
     def level(self) -> int:
-        return self._lscale.level(self.level_sb.value())
+        """The level for the box's value. A value the user did not edit is the level
+        last shown (never read again on a newer scale). Volts typed under an older
+        range are read on the range in force (volts stay volts); a unit change
+        (V <-> %) uses the scale the box shows."""
+        if self._shown_level is not None and self.level_sb.value() == self._shown_value:
+            return self._shown_level
+        ls = self._lscale if self._shown is None or self._lscale.unit == self._shown.unit else self._shown
+        return ls.level(self.level_sb.value())
 
-    def _send_trigger(self, *_):
+    def _send_trigger(self, *_, level: Optional[int] = None):
         self.worker.set("trigger", proto.TRIG_MODES[self.tmode_cb.currentData()],
                         proto.TRIG_EDGES[self.tedge_cb.currentData()],
-                        proto.TRIG_SOURCES[self.tsrc_cb.currentData()], self.level())
+                        proto.TRIG_SOURCES[self.tsrc_cb.currentData()],
+                        self.level() if level is None else level)
 
     def _level_done(self) -> None:
-        if self.st is not None and self.level() != self.st.trig_level:
-            self._send_trigger()
+        """Enter or focus out: send the typed level, then show it on the scale in force."""
+        if self.st is None:
+            return
+        lv = self.level()
+        if lv != self.st.trig_level:
+            self._send_trigger(level=lv)
+        self._show_level(lv)
+
+    def _show_level(self, lv: int) -> None:
+        """Put the scale in force and level `lv` in the box. Sends nothing."""
+        self._apply_level_scale()
+        sb = self.level_sb
+        sb.blockSignals(True)
+        sb.setValue(self._lscale.value(lv))
+        sb.blockSignals(False)
+        self._shown_level, self._shown_value = lv, sb.value()
 
     def _apply_level_scale(self) -> None:
+        """Set the box to the scale in force, only when it changed: each setter makes
+        Qt write the edit text again (code review 2026-11-23 Q-1)."""
         ls = self._lscale
+        if ls == self._shown:
+            return
+        self._shown = ls
         sb = self.level_sb
         sb.blockSignals(True)
         sb.setDecimals(ls.decimals)
