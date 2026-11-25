@@ -199,6 +199,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_run = self._action("Run/Stop", self.panel.toggle_run, "Space", SP.SP_MediaPause,
                                     tip="Run or stop the acquisition (Space)")
         self.act_run.setAutoRepeat(False)       # a held Space key must not queue a set per repeat
+        # Made once: a new QIcon per SCOPE_STATE (2 Hz) grew native memory ~3.7 KB each (stage-180)
+        self._run_icons = {True: self.style().standardIcon(SP.SP_MediaPause),
+                           False: self.style().standardIcon(SP.SP_MediaPlay)}
+        self._run_icon_cont = True
         self.act_single = self._action("Single", self.panel.single, None, SP.SP_MediaSkipForward,
                                        tip="Capture one triggered record, then hold it")
         self.act_pause = self._action("Pause display", self._pause, None, SP.SP_MediaPause,
@@ -371,8 +375,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.st = s
         self.panel.set_state(s)
         self._actions_enabled(True)
-        self.act_run.setIcon(self.style().standardIcon(
-            QtWidgets.QStyle.SP_MediaPause if continuous(s) else QtWidgets.QStyle.SP_MediaPlay))
+        if continuous(s) != self._run_icon_cont:   # set only on a change (see _build_actions)
+            self._run_icon_cont = continuous(s)
+            self.act_run.setIcon(self._run_icons[self._run_icon_cont])
         self._follow_mode(s.mode)
         self._update_scope_status()
 

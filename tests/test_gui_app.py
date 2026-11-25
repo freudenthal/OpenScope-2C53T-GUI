@@ -480,6 +480,22 @@ class TestStage180Window(WindowCase):
         dlg.close()
         self.assertIsNone(self.win._info_dlg)
 
+    def test_run_icon_is_set_only_when_run_state_changes(self):
+        # A new QIcon on every SCOPE_STATE (2 Hz) grew native memory (stage-180 soak)
+        self.connect()
+        key = self.win.act_run.icon().cacheKey()
+        calls = []
+        real = self.win.act_run.setIcon
+        self.win.act_run.setIcon = lambda i: (calls.append(i), real(i))
+        for _ in range(5):
+            self.win._scope_state(state(running=True))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.win.act_run.icon().cacheKey(), key)
+        self.win._scope_state(state(running=False))
+        self.win._scope_state(state(running=False))
+        self.win._scope_state(state(running=True))
+        self.assertEqual(len(calls), 2)
+
     def test_space_does_not_auto_repeat(self):
         self.assertFalse(self.win.act_run.autoRepeat())
 
