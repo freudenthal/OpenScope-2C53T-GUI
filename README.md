@@ -91,6 +91,19 @@ The library (`openscope` 0.6.0 or later) does the work; the window only guides i
 * Return to the FNIRSI firmware is a command-line function only: `openscope update
   --stock-image <file>`.
 
+## Windows release package
+`packaging/build_release.ps1` makes the zip for Windows users with no Python: PyInstaller
+one-folder build (`packaging/openscope-gui.spec`), the bundled firmware image with its manifest
+and `SOURCE.txt` in `firmware\`, `LICENSE.txt`, `THIRD-PARTY-NOTICES.txt` and the end-user
+`README.txt` (`packaging/README.txt`). It needs a build venv with PyInstaller, both
+repositories with no changes, and a `guest-coldtrace` image of the product HEAD with its
+manifest. Output: `<workspace>\releases\openscope-gui-<version>\` and
+`openscope-gui-<version>-upload\` (zip and `SHA256SUMS.txt`).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1 -Version 0.2.0
+```
+
 ## Layers
 | module | job |
 |---|---|

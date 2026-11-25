@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import html
+import json
 import sys
+from pathlib import Path
+from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -81,9 +84,32 @@ class DebugConsoleDialog(QtWidgets.QDialog):
         self.out.appendPlainText(text.rstrip())
 
 
-def about_text(firmware: str) -> str:
+BUILD_INFO = "build_info.json"     # written by packaging/build_release.ps1 (stage-220)
+
+
+def build_info(folder: Optional[Path] = None) -> Optional[dict]:
+    """The release package's build_info.json (next to the exe), or None when
+    this is not a release package or the file cannot be read."""
+    if folder is None:
+        if not getattr(sys, "frozen", False):
+            return None
+        folder = Path(sys.executable).resolve().parent
+    try:
+        info = json.loads((Path(folder) / BUILD_INFO).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def _short(rev) -> str:
+    return str(rev)[:7] if rev else "?"
+
+
+def about_text(firmware: str, info: Optional[dict] = None) -> str:
     from openscope import __version__ as lib
     from . import __version__ as gui
+    if info is None:
+        info = build_info()
     try:
         import PySide6
         qt = PySide6.__version__
@@ -95,8 +121,17 @@ def about_text(firmware: str) -> str:
     except Exception:                       # pragma: no cover
         pg = "?"
     py = ".".join(str(x) for x in sys.version_info[:3])
-    rows = [("OpenScope GUI", gui), ("openscope library", lib),
-            ("Firmware", firmware or "not connected"),
+    if info:
+        gui_row = f"{gui} (commit {_short(info.get('gui_commit'))})"
+        lib_row = f"{lib} (commit {_short(info.get('library_commit'))})"
+        fw = info.get("firmware") or {}
+        bundled = (f"{fw.get('target', '?')} {fw.get('git_rev') or '?'}, "
+                   f"built {fw.get('build_time') or '?'}, API level {fw.get('api_level', '?')}")
+    else:
+        gui_row, lib_row, bundled = gui, lib, "none (not a release package)"
+    rows = [("OpenScope GUI", gui_row), ("openscope library", lib_row),
+            ("Firmware on the unit", firmware or "not connected"),
+            ("Bundled firmware", bundled),
             ("PySide6", qt), ("pyqtgraph", pg), ("Python", py)]
     body = "".join(f"<tr><td>{html.escape(a)}</td><td>&nbsp;{html.escape(b)}</td></tr>" for a, b in rows)
     return ("<b>OpenScope 2C53T</b><p>Live oscilloscope, multimeter and control of the FNIRSI "

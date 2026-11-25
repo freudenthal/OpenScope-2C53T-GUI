@@ -1,0 +1,83 @@
+SOURCE CODE OF THIS PACKAGE — OpenScope GUI {version} for Windows
+=================================================================
+
+This package holds object code of programs under the GNU General Public License
+version 3 (GPL-3.0). This file tells you where the Corresponding Source is and
+how to build it again.
+
+
+1. The firmware image in this folder
+------------------------------------
+
+  Image        {image_name}
+  Size         {image_size} bytes
+  SHA-256      {image_sha256}
+  Build time   {build_time}  (the image holds this text)
+
+  Source       {product_url}
+  Commit       {product_commit}
+  Tag          {product_tag}
+  Download     {product_url}/archive/{product_commit}.zip
+
+  Build dependencies (not in the repository; clone them into firmware/):
+    firmware/at32f403a_lib  https://github.com/ArteryTek/AT32F403A_407_Firmware_Library
+                            commit {at32_commit}
+    firmware/FreeRTOS       https://github.com/FreeRTOS/FreeRTOS-Kernel
+                            commit {freertos_commit}
+
+  Toolchain    {toolchain}
+
+  Build command (in the repository root):
+    cd firmware
+    make {build_target}
+  The output is firmware/build/firmware.bin.
+
+  The builds are not reproducible: the image holds the build date and time, so
+  a new build of the same commit has a different SHA-256 and build time. The
+  code is the same.
+
+
+2. The program (openscope-gui.exe and the _internal folder)
+-----------------------------------------------------------
+
+  OpenScope GUI     {gui_url}
+    Commit          {gui_commit}
+    Tag             {gui_tag}
+    Download        {gui_url}/archive/{gui_commit}.zip
+
+  openscope library (tools/openscope_host in the firmware repository)
+    Commit          {product_commit}  (the same commit as the firmware)
+
+  The program was made with PyInstaller (one-folder mode) from these two
+  sources and the Python packages that THIRD-PARTY-NOTICES.txt lists. The build
+  script is packaging/build_release.ps1 in the GUI repository.
+
+
+3. Written offer (GPL-3.0 section 6)
+------------------------------------
+
+  The Corresponding Source of the GPL parts of this package is available at no
+  charge from the GitHub repositories above, at the commits named above, from
+  the same place as this package.
+
+  If you cannot get it from there, open an issue at
+  {product_url}/issues
+  and ask for the source of OpenScope GUI {version}. For at least three years
+  after the date of this package, and for as long as this package is offered,
+  we give any third party a copy of the Corresponding Source for no more than
+  the cost of the medium and the shipping.
+
+
+4. The FPGA configuration data in the firmware image (not GPL source)
+---------------------------------------------------------------------
+
+  The firmware image holds one copy of the FPGA configuration bitstream
+  (Gowin GW1N-2 family, 115,638 bytes) that the instrument needs to measure.
+  This data was extracted from the FNIRSI stock firmware V1.2.0
+  (firmware/src/drivers/fpga_cal_table.h). It is binary data from FNIRSI, not
+  source code of this project, and the GPL-3.0 does not apply to it. We have no
+  source for it. The upstream OpenScope-2C53T project ships the same data in
+  its own release images.
+
+  The FNIRSI stock firmware itself is NOT in this package. To go back to the
+  stock firmware you need your own copy of the FNIRSI file.
