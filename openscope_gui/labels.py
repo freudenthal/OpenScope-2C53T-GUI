@@ -510,6 +510,8 @@ NOTE_WORDS = {
     "BAD_ARG": "The unit refused a value",
     "UNSUPPORTED": "This firmware does not do that",
 }
+# stage-230: a scope set outside scope mode (NAK UNSUPPORTED_IN_MODE)
+SCOPE_MODE_NEEDED = "scope settings need scope mode"
 _HEX = re.compile(r"0x[0-9A-Fa-f]+")
 _UID = re.compile(r"\b[0-9A-Fa-f]{24}\b")      # a unit ID (stage-210: dialogs only)
 
@@ -539,6 +541,8 @@ def job_words(job: str, ok: bool, msg: str) -> str:
         name = SET_WORDS.get(what, "Setting")
         if ok:
             return f"{name} changed"
+        if "UNSUPPORTED_IN_MODE" in msg:
+            return f"{name} not changed: {SCOPE_MODE_NEEDED}"
         for nak, words in NOTE_WORDS.items():
             if nak in msg:
                 return f"{name} not changed: {words.lower()}"

@@ -228,6 +228,17 @@ class TestNotes(unittest.TestCase):
                          "Volts/div not changed: the unit refused a value")
         self.assertEqual(labels.job_words("press", True, "MENU"), "Key press sent")
 
+    def test_scope_set_outside_scope_mode_in_words(self):
+        # stage-230: the firmware answers a scope set outside scope mode with
+        # NAK UNSUPPORTED_IN_MODE; the worker reports "<what> refused: <NAK>: <hint>".
+        for what, name in (("timebase", "Timebase"), ("vdiv", "Volts/div"), ("trigger", "Trigger"),
+                           ("run", "Run/Stop")):
+            text = labels.job_words("set", False, f"{what} refused: UNSUPPORTED_IN_MODE: x")
+            self.assertTrue(text.startswith(f"{labels.SET_WORDS.get(what, name)} not changed"), text)
+            self.assertIn("scope settings need scope mode", text)
+        # a waveform NAK in another mode keeps its own words
+        self.assertEqual(labels.note_words("UNSUPPORTED_IN_MODE"), "Not available in this unit mode")
+
 
 if __name__ == "__main__":
     unittest.main()

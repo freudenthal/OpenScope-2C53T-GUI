@@ -44,7 +44,9 @@ package. The GUI needs a firmware build with the same protocol version as the li
   sends `cal restore` or `mem write`), Help (About). Window size, dock layout and View choices
   are kept between runs.
 * **Toolbar and keys:** Run/Stop (Space), Single, Screenshot (Ctrl+P), Save waveform (Ctrl+S),
-  Pause display; F1 About. Shortcuts never send unit key presses. The unit keys dock (View ▸
+  Pause display; F1 About. Run/Stop and Single work only while the unit is in scope mode
+  (the firmware refuses scope settings in the other modes: "scope settings need scope mode").
+  Shortcuts never send unit key presses. The unit keys dock (View ▸
   Unit keys, hidden by default) sends key presses for functions that have no control yet.
 * **Status bar:** connection, unit mode and battery, the scope state in words ("Running ·
   2.56 ms/div · 12.49 kS/s (measured)", "held record", "record taken at …" when the shown

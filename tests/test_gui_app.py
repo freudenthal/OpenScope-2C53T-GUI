@@ -149,6 +149,46 @@ class TestModesAndTabs(WindowCase):
                          ["Oscilloscope", "Multimeter", "Signal generator"])
 
 
+class TestScopeModeActions(WindowCase):
+    """stage-230: Run/Stop and Single only while the unit is in scope mode."""
+
+    def test_enabled_in_scope_mode_only(self):
+        w = self.win
+        self.assertFalse(w.act_run.isEnabled() or w.act_single.isEnabled())   # not connected
+        self.connect(mode=0)
+        self.assertTrue(w.act_run.isEnabled() and w.act_single.isEnabled())
+        for mode in (1, 2, 3):
+            w._status(status(mode))
+            self.assertFalse(w.act_run.isEnabled(), f"Run/Stop enabled in mode {mode}")
+            self.assertFalse(w.act_single.isEnabled(), f"Single enabled in mode {mode}")
+            self.assertIn("scope settings need scope mode", w.act_run.toolTip())
+            w._scope_state(state(mode=mode))                 # a state in that mode keeps them off
+            self.assertFalse(w.act_run.isEnabled())
+        w._status(status(0))
+        self.assertTrue(w.act_run.isEnabled() and w.act_single.isEnabled())
+        self.assertNotIn("scope mode", w.act_run.toolTip())
+
+    def test_connect_in_meter_mode_keeps_them_off(self):
+        self.connect(mode=1)
+        self.assertFalse(self.win.act_run.isEnabled() or self.win.act_single.isEnabled())
+
+    def test_space_in_meter_mode_sends_nothing(self):
+        w = self.win
+        self.connect(mode=0)
+        self.jobs()
+        w._status(status(1))
+        w.act_run.trigger()                                  # a disabled action does not fire
+        w.act_single.trigger()
+        self.assertEqual(self.jobs(), [])
+
+    def test_refused_set_shows_scope_mode_words(self):
+        w = self.win
+        self.connect(mode=0)
+        w._job_done("set", False, "timebase refused: UNSUPPORTED_IN_MODE: the scope is not in "
+                                  "oscilloscope mode")
+        self.assertIn("scope settings need scope mode", w.sb_note.text())
+
+
 class TestScopePanel(WindowCase):
     def test_disabled_until_a_state_arrives(self):
         p = self.win.panel

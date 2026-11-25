@@ -38,6 +38,9 @@ KEYS = [["CH1", "CH2", "MOVE", "SELECT", "TRIGGER"],
         ["PRM", "AUTO", "SAVE", "MENU", "OK"],
         ["UP", "DOWN", "LEFT", "RIGHT"]]          # POWER left out on purpose (shuts the unit down)
 TAB_MODES = (0, 1, 2)                             # tab index == unit mode id
+SCOPE_MODE = 0                                    # stage-230: scope sets only here
+RUN_TIP = "Run or stop the acquisition (Space)"
+SINGLE_TIP = "Capture one triggered record, then hold it"
 MODE_TIMEOUT_MS = 8000                            # longest SET_MODE (5 s) + margin
 SETTINGS_BANNER = "The unit shows its settings menu"
 PORT_BUSY_TEXT = "Port in use by another program"   # status bar, stage-180 (Q-10)
@@ -222,14 +225,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_meter_log = self._action("Record meter to CSV…", self._record_meter, checkable=True)
         self.act_exit = self._action("Exit", self.close, "Ctrl+Q")
         self.act_run = self._action("Run/Stop", self.panel.toggle_run, "Space", SP.SP_MediaPause,
-                                    tip="Run or stop the acquisition (Space)")
+                                    tip=RUN_TIP)
         self.act_run.setAutoRepeat(False)       # a held Space key must not queue a set per repeat
         # Made once: a new QIcon per SCOPE_STATE (2 Hz) grew native memory ~3.7 KB each (stage-180)
         self._run_icons = {True: self.style().standardIcon(SP.SP_MediaPause),
                            False: self.style().standardIcon(SP.SP_MediaPlay)}
         self._run_icon_cont = True
         self.act_single = self._action("Single", self.panel.single, None, SP.SP_MediaSkipForward,
-                                       tip="Capture one triggered record, then hold it")
+                                       tip=SINGLE_TIP)
         self.act_pause = self._action("Pause display", self._pause, None, SP.SP_MediaPause,
                                       checkable=True, tip="Stop reading the unit (the unit keeps running)")
         self.act_control = self.control_dock.toggleViewAction()
@@ -332,6 +335,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """The unit's mode: select its tab, sending nothing."""
         self._unit_mode = mode
         self.banner.setVisible(mode == 3)
+        # stage-230 (U-4): the firmware refuses scope settings outside scope
+        # mode (NAK UNSUPPORTED_IN_MODE), so Run/Stop and Single wait for it.
+        self._actions_enabled(self.st is not None and mode == SCOPE_MODE)
         if self._pending_mode is not None or mode not in TAB_MODES:
             return
         if self.tabs.currentIndex() != mode:
@@ -388,6 +394,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _actions_enabled(self, on: bool) -> None:
         self.act_run.setEnabled(on)
         self.act_single.setEnabled(on)
+        note = "" if on or self._state != "connected" else f" ({labels.SCOPE_MODE_NEEDED})"
+        self.act_run.setToolTip(RUN_TIP + note)
+        self.act_single.setToolTip(SINGLE_TIP + note)
 
     def _status(self, st: proto.Status) -> None:
         self._fw = st.fw_version
@@ -405,7 +414,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _scope_state(self, s: proto.ScopeState) -> None:
         self.st = s
         self.panel.set_state(s)
-        self._actions_enabled(True)
         if continuous(s) != self._run_icon_cont:   # set only on a change (see _build_actions)
             self._run_icon_cont = continuous(s)
             self.act_run.setIcon(self._run_icons[self._run_icon_cont])
