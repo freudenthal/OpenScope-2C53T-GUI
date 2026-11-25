@@ -159,7 +159,7 @@ class BackupDialog(QtWidgets.QDialog):
         lay.addWidget(bb)
         self.resize(560, 260)
         worker.backup_progress.connect(self.progress)
-        worker.backup_result.connect(self.result)
+        worker.backup_result.connect(self.show_result)
         if connected:
             self.running = True
             worker.backup(root)
@@ -172,7 +172,7 @@ class BackupDialog(QtWidgets.QDialog):
             self.bar.setRange(0, total)
             self.bar.setValue(done)
 
-    def result(self, r: dict) -> None:
+    def show_result(self, r: dict) -> None:
         self.running = False
         self.bar.hide()
         if "error" in r:
@@ -198,7 +198,7 @@ class BackupDialog(QtWidgets.QDialog):
         if self.running:
             self.worker.cancel_backup()
         for sig, slot in ((self.worker.backup_progress, self.progress),
-                          (self.worker.backup_result, self.result)):
+                          (self.worker.backup_result, self.show_result)):
             try:
                 sig.disconnect(slot)
             except (RuntimeError, TypeError):
@@ -503,7 +503,7 @@ class CopyPage(_Page):
 
     def isComplete(self) -> bool:
         w = self.wiz()
-        return w is not None and (w.failed or w.finished or "wait" in w.steps)
+        return w is not None and (w.failed or w.flow_done or "wait" in w.steps)
 
 
 class RebootPage(_Page):
@@ -521,7 +521,7 @@ class RebootPage(_Page):
 
     def isComplete(self) -> bool:
         w = self.wiz()
-        return w is not None and (w.failed or w.finished)
+        return w is not None and (w.failed or w.flow_done)
 
 
 class ResultPage(_Page):
@@ -543,7 +543,7 @@ class ResultPage(_Page):
 
     def isComplete(self) -> bool:
         w = self.wiz()
-        return w is not None and (w.finished or w.failed)
+        return w is not None and (w.flow_done or w.failed)
 
 
 # ── the wizard ─────────────────────────────────────────────────────────
@@ -572,7 +572,7 @@ class UpdateWizard(QtWidgets.QWizard):
         self.steps: List[str] = []
         self.gate_step: Optional[str] = None
         self.locked = False             # from the copy until the flow ends: no cancel, no close
-        self.finished = False
+        self.flow_done = False
         self.failed = False
         self.res: Optional[up.UpdateResult] = None
         self.err: Optional[BaseException] = None
@@ -694,7 +694,7 @@ class UpdateWizard(QtWidgets.QWizard):
         self._end()
 
     def _end(self) -> None:
-        self.finished = True
+        self.flow_done = True
         self.locked = False
         self._changed()
 

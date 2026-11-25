@@ -275,6 +275,32 @@ class TestBanner(unittest.TestCase):
         i = texts.index("Device information…")
         self.assertEqual(texts[i + 1:i + 3], ["Back up calibration…", "Update firmware…"])
 
+    def test_menu_and_banner_open_the_wizard(self):
+        # hand check 2026-11-25: the wizard's own `finished` attribute hid the
+        # QDialog signal, so neither the menu item nor the button opened it.
+        w = self.win
+        self.worker.compat.emit(Compat("binary", 0, FW))
+        for how in (w.act_update.trigger, w.compat_button.click):
+            with self.subTest(how=how):
+                how()
+                self.app.processEvents()
+                self.assertIsNotNone(w.wizard)
+                self.assertTrue(w.wizard.isVisible())
+                self.assertEqual(w.wizard.currentId(), uw.CHECK)
+                w.wizard.reject()
+                self.app.processEvents()
+                self.assertIsNone(w.wizard)
+                self.assertTrue(self.worker.online)
+
+    def test_menu_opens_the_backup_dialog(self):
+        w = self.win
+        w.act_backup.trigger()
+        self.app.processEvents()
+        dlgs = [d for d in w.findChildren(uw.BackupDialog) if d.isVisible()]
+        self.assertEqual(len(dlgs), 1)
+        self.assertIn("not connected", dlgs[0].text.text())
+        dlgs[0].reject()
+
     def test_backup_dialog_when_not_connected_queues_nothing(self):
         dlg = uw.BackupDialog(self.worker, False, self.win)
         self.assertTrue(self.worker._jobs.empty())
