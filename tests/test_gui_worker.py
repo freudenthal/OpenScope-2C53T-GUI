@@ -616,8 +616,9 @@ class TestWorkerStage180(unittest.TestCase):
         w = self.make(Opener(dev))
         w.step()
         w.press("OK")
-        w.screenshot("unused.png")                  # the next job still runs
-        w.step()
+        with tempfile.TemporaryDirectory() as d:
+            w.screenshot(os.path.join(d, "s.png"))  # the next job still runs
+            w.step()
         self.assertEqual([(j, ok) for j, ok, _ in self.ev["job"]], [("press", False), ("screenshot", True)])
         self.assertEqual(self.states(), ["connected"])
 
