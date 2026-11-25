@@ -4,6 +4,7 @@ test uses its own temporary QSettings file. Needs the `gui` extra; skipped
 without it."""
 from __future__ import annotations
 
+import importlib.util
 import os
 import queue
 import re
@@ -17,15 +18,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _paths  # noqa: E402,F401  (this repo and the openscope library)
 from openscope import proto  # noqa: E402
 
-try:
+# Stage-180: only a missing PySide6/numpy/pyqtgraph skips; an import error
+# inside openscope_gui fails the suite.
+HAVE_QT = all(importlib.util.find_spec(m) is not None for m in ("PySide6", "numpy", "pyqtgraph"))
+if HAVE_QT:
     import numpy as np  # noqa: F401
-    from PySide6 import QtCore, QtTest, QtWidgets
+    from PySide6 import QtCore, QtGui, QtTest, QtWidgets
     from openscope_gui.app import MainWindow  # noqa: E402
-    from openscope_gui.window import SETTINGS_BANNER  # noqa: E402
+    from openscope_gui.window import PORT_BUSY_TEXT, SETTINGS_BANNER  # noqa: E402
     from openscope_gui.worker import ScopeFrame, Worker, shell_refused  # noqa: E402
-    HAVE_QT = True
-except ImportError:          # pragma: no cover - depends on the venv
-    HAVE_QT = False
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_gui_labels import REAL_DESCRIPTION  # noqa: E402
@@ -442,6 +443,66 @@ class TestFunctions(WindowCase):
         self.assertTrue(self.win.act_connect.isEnabled())
         self.win.act_connect.trigger()
         self.assertTrue(self.worker.online)
+
+
+class TestStage180Window(WindowCase):
+    """Review Q-10 and the close order (stage-180)."""
+
+    def test_busy_port_text_in_the_status_bar(self):
+        busy = "cannot open COM7: in use by another process (only one client at a time)"
+        self.win._set_conn("searching", busy)
+        self.assertIn(PORT_BUSY_TEXT, self.win.sb_conn.text())
+        self.assertEqual(self.win.sb_conn.toolTip(), busy)
+        self.win._set_conn("searching", "no OpenScope found on USB 2e3c:5740 (AT32 VCP)")
+        self.assertNotIn(PORT_BUSY_TEXT, self.win.sb_conn.text())
+
+    def test_lost_connection_clears_the_trace(self):
+        self.connect()
+        self.win._frame(frame())
+        self.assertIsNotNone(self.win.scope.frame)
+        self.win._set_conn("disconnected", "NoDevice: port lost")
+        self.assertIsNone(self.win.scope.frame)
+        self.assertIn("Connection lost", self.win.sb_conn.text())
+
+    def test_port_menu_deletes_old_actions(self):
+        self.win._fill_ports()
+        old = list(self.win.port_group.actions())
+        self.win._fill_ports()
+        QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        alive = [a for a in self.win.findChildren(QtGui.QAction) if a in old]
+        self.assertEqual(alive, [], "old port actions were not deleted")
+        self.assertEqual(len(self.win.port_group.actions()), len(old))
+
+    def test_info_dialog_is_deleted_on_close(self):
+        self.win._device_info()
+        dlg = self.win._info_dlg
+        self.assertTrue(dlg.testAttribute(QtCore.Qt.WA_DeleteOnClose))
+        dlg.close()
+        self.assertIsNone(self.win._info_dlg)
+
+    def test_space_does_not_auto_repeat(self):
+        self.assertFalse(self.win.act_run.autoRepeat())
+
+    def test_close_stops_timers_then_worker_then_files(self):
+        stats = os.path.join(self.tmp, "s.csv")
+        events = os.path.join(self.tmp, "e.txt")
+        w = MainWindow(self.worker, stats, events,
+                       settings=QtCore.QSettings(self.ini, QtCore.QSettings.IniFormat))
+        self._wins = [w]
+        w.mode_timer.start(10000)
+        seen = {}
+
+        def stop(wait_ms=5000):
+            seen["timers"] = [t.isActive() for t in (w.timer, w.rate_timer, w.mode_timer)]
+            seen["files_open"] = (not w._stats_f.closed, not w._events.closed)
+            return True
+        self.worker.stop = stop
+        w.close()
+        self.assertEqual(seen["timers"], [False, False, False], "a timer still ran when the worker stopped")
+        self.assertEqual(seen["files_open"], (True, True), "files closed before the worker stopped")
+        self.assertTrue(w._stats_f.closed and w._events.closed)
+        with open(events, encoding="utf-8") as f:
+            self.assertIn("closed", f.read())
 
 
 if __name__ == "__main__":

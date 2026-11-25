@@ -4,6 +4,7 @@ Needs the `gui` extra; skipped without it."""
 from __future__ import annotations
 
 import csv
+import importlib.util
 import os
 import sys
 import tempfile
@@ -14,14 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _paths  # noqa: E402,F401  (this repo and the openscope library)
 from openscope import proto  # noqa: E402
 
-try:
+# Stage-180: only a missing PySide6/numpy/pyqtgraph skips; an import error
+# inside openscope_gui fails the suite.
+HAVE_QT = all(importlib.util.find_spec(m) is not None for m in ("PySide6", "numpy", "pyqtgraph"))
+if HAVE_QT:
     import numpy as np
     from PySide6 import QtWidgets
     from openscope_gui import views  # noqa: E402
     from openscope_gui.worker import MeterSample, ScopeFrame  # noqa: E402
-    HAVE_QT = True
-except ImportError:          # pragma: no cover - depends on the venv
-    HAVE_QT = False
 
 FS = 12490
 

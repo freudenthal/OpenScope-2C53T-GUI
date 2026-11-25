@@ -11,7 +11,7 @@ requires-python = ">=3.9"
 # `openscope` is the host library in the firmware repository
 # (OpenScope-2C53T/tools/openscope_host). It is not on PyPI: install it first,
 # editable, from your firmware checkout. See README.md.
-dependencies = ["openscope>=0.1.0", "PySide6-Essentials", "pyqtgraph>=0.14", "numpy"]
+dependencies = ["openscope>=0.2.0", "PySide6-Essentials", "pyqtgraph>=0.14", "numpy"]
 
 [project.scripts]
 openscope-gui = "openscope_gui.app:main"

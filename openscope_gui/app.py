@@ -10,6 +10,7 @@ data.
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
 
 from PySide6 import QtCore, QtWidgets
@@ -36,7 +37,9 @@ def main(argv=None) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
     app.setOrganizationName("OpenScope")
     app.setApplicationName("openscope-gui")
-    worker = Worker(Device.open)
+    # reopen_wait=0: a lost port raises at once and the worker reconnects
+    # (stage-180, H-1). The CLI keeps the library default (6 s).
+    worker = Worker(functools.partial(Device.open, reopen_wait=0))
     worker.port = a.port
     mask = proto.channel_mask(a.channels)
     win = MainWindow(worker, a.stats, a.events)

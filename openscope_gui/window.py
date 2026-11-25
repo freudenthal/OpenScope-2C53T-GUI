@@ -25,7 +25,7 @@ from openscope import proto
 from . import dialogs, labels
 from .scope_panel import ScopePanel, continuous
 from .views import MeterView, Rate, ScopeView
-from .worker import ScopeFrame, Worker
+from .worker import ScopeFrame, Worker, port_busy
 
 DRAW_HZ = 30
 KEYS = [["CH1", "CH2", "MOVE", "SELECT", "TRIGGER"],
@@ -34,6 +34,7 @@ KEYS = [["CH1", "CH2", "MOVE", "SELECT", "TRIGGER"],
 TAB_MODES = (0, 1, 2)                             # tab index == unit mode id
 MODE_TIMEOUT_MS = 8000                            # longest SET_MODE (5 s) + margin
 SETTINGS_BANNER = "The unit shows its settings menu"
+PORT_BUSY_TEXT = "Port in use by another program"   # status bar, stage-180 (Q-10)
 PLACEHOLDER = {1: "Multimeter function controls come in stage 088.",
                2: "Signal generator controls come in stage 089."}
 VIEW_DEFAULTS = {"view/control_panel": True, "view/unit_keys": False,
@@ -197,6 +198,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_exit = self._action("Exit", self.close, "Ctrl+Q")
         self.act_run = self._action("Run/Stop", self.panel.toggle_run, "Space", SP.SP_MediaPause,
                                     tip="Run or stop the acquisition (Space)")
+        self.act_run.setAutoRepeat(False)       # a held Space key must not queue a set per repeat
         self.act_single = self._action("Single", self.panel.single, None, SP.SP_MediaSkipForward,
                                        tip="Capture one triggered record, then hold it")
         self.act_pause = self._action("Pause display", self._pause, None, SP.SP_MediaPause,
@@ -326,7 +328,8 @@ class MainWindow(QtWidgets.QMainWindow):
         color = {"connected": "#27ae60", "disconnected": "#eb5757"}.get(state, "#f2994a")
         text = {"connected": f"Connected ({detail})" if detail else "Connected",
                 "disconnected": "Connection lost", "offline": "Disconnected",
-                "searching": "Looking for the unit…"}.get(state, state)
+                "searching": PORT_BUSY_TEXT if port_busy(detail) else "Looking for the unit…"
+                }.get(state, state)
         self.sb_conn.setText(f"<b style='color:{color}'>{text}</b>")
         self.sb_conn.setToolTip(detail)
         self.act_connect.setEnabled(state == "offline")
@@ -340,6 +343,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pending_mode = None
             self.banner.hide()
             self.panel.clear()
+            self.scope.clear()                  # no old trace after a reconnect (review Q-10)
             self.panel.set_description(None)
             self._actions_enabled(False)
             if state == "disconnected":
@@ -472,6 +476,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.port_menu.clear()
         for a in self.port_group.actions():
             self.port_group.removeAction(a)
+            a.deleteLater()                     # the menu does not own them: delete, or they pile up
         try:
             ports = candidate_ports()
         except Exception:
@@ -487,6 +492,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _device_info(self) -> None:
         self._info_dlg = dialogs.DeviceInfoDialog(self)
+        self._info_dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         self._info_dlg.finished.connect(lambda _: setattr(self, "_info_dlg", None))
         self._info_dlg.show()
         self.worker.request_info()
@@ -546,8 +552,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._note(f"Window image saved: {path}")
 
     def closeEvent(self, e) -> None:
+        """Timers first (no slot may run on a closing window), then the worker
+        (it may still emit), then the files that its signals write to."""
         self.save_settings()
-        self.timer.stop()
+        for t in (self.timer, self.rate_timer, self.mode_timer):
+            t.stop()
         self.worker.stop()
         self.meter.stop_log()
         if self._stats:

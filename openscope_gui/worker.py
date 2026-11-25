@@ -30,6 +30,14 @@ NAKs are normal (NO_CAPTURE_DATA before the first capture, NOT_READY when no
 tear-free copy could be taken or the meter is blank — G-220, G-230): they are
 reported as notes and polled again. A lost port (unplug, reboot, IAP) drops
 the Device and goes back to searching, so a replug recovers without a restart.
+
+Stage-180: the worker owns reconnect. The GUI opener is
+`Device.open(reopen_wait=0)`, so a lost port raises at once instead of
+blocking up to 6 s inside a request: the window shows "Connection lost" at
+once, and every loss goes through a new connect and a new description (a
+reboot or a reflash can change it). Each job always emits `job_done`, also
+for an unexpected error; a job error that is a link loss then drops the
+device. A busy port stays "searching" with the reason as the detail.
 """
 from __future__ import annotations
 
@@ -44,6 +52,7 @@ from PySide6 import QtCore
 
 from openscope import proto
 from openscope.device import Device, DeviceError, Nak, Timeout
+from openscope.link import NoDevice
 
 MODE_SCOPE, MODE_METER = 0, 1
 
@@ -52,6 +61,21 @@ SETTERS = {"mode": "set_mode", "timebase": "set_timebase", "vdiv": "set_vdiv",
            "trigger": "set_trigger", "run": "run_stop", "probe": "set_probe"}
 # I-40: never sent to the unit, whatever the user types in the debug console.
 FORBIDDEN_SHELL = ("cal restore", "mem write")
+
+
+def link_lost(e: BaseException) -> bool:
+    """True if a job error means the port is gone (the device must be dropped)."""
+    if isinstance(e, (OSError, NoDevice)):
+        return True
+    if isinstance(e, DeviceError) and not isinstance(e, (Nak, Timeout)):
+        text = str(e).lower()
+        return "port lost" in text or "reconnect" in text
+    return False
+
+
+def port_busy(detail: str) -> bool:
+    """True if a connect error says that another program holds the port."""
+    return "in use by another process" in detail
 
 
 def shell_refused(line: str) -> bool:
@@ -119,12 +143,13 @@ class Worker(QtCore.QThread):
         self._jobs: "queue.Queue[tuple]" = queue.Queue()
         self._halt = threading.Event()
         self.dev: Optional[Device] = None
-        self.mask = proto.WAVE_MASK_CH1     # set from the GUI thread (an int: atomic)
+        self.mask = proto.WAVE_MASK_CH1     # set from the GUI thread only (an int: atomic)
         self.paused = False
         self.mode: Optional[int] = None
         self._state = ""
+        self._detail = ""
         self._last_status = -1e9
-        self._last_fid: Optional[int] = None
+        self._last_key: Optional[Tuple[int, int]] = None    # (frame_id, mask used): worker thread only
         self._last_uc: Optional[int] = None
         self._timeouts = 0
         self.has_state: Optional[bool] = None   # None = not asked yet on this connection
@@ -136,8 +161,7 @@ class Worker(QtCore.QThread):
     # ── called from the GUI thread ────────────────────────────────
     def set_channels(self, mask: int) -> None:
         proto.channel_mask([c for c in (1, 2) if mask & (1 << (c - 1))])   # validates 1..3
-        self.mask = mask
-        self._last_fid = None           # a new channel set repaints even a held record
+        self.mask = mask    # the worker dedupes on (frame_id, mask): a new set repaints a held record
 
     def press(self, button) -> None:
         self._jobs.put(("press", proto.button_id(button)))
@@ -188,8 +212,9 @@ class Worker(QtCore.QThread):
         self._halt.wait(s)
 
     def _set_state(self, state: str, detail: str) -> None:
-        if state != self._state or state == "connected":
-            self._state = state
+        # A new detail is news too (e.g. "not found" -> "in use by another process").
+        if state != self._state or detail != self._detail or state == "connected":
+            self._state, self._detail = state, detail
             self.connection.emit(state, detail)
 
     def _drop(self, why: Optional[str]) -> None:
@@ -221,7 +246,7 @@ class Worker(QtCore.QThread):
                 self._pause(self.retry_s)
                 return
             self.stats["connects"] += 1
-            self._last_status, self._last_fid, self._last_uc, self._timeouts = -1e9, None, None, 0
+            self._last_status, self._last_key, self._last_uc, self._timeouts = -1e9, None, None, 0
             self.has_state = None
             self._need_desc = True
             self._set_state("connected", getattr(self.dev.link, "port", "") or "")
@@ -260,20 +285,24 @@ class Worker(QtCore.QThread):
         except proto.ProtocolError as e:
             self.note.emit(f"protocol: {e}")
             self._pause(self.nak_s)
-        except Exception as e:              # DeviceError, NoDevice from a failed reopen, OSError
+        except Exception as e:              # DeviceError, NoDevice (port lost), OSError, a job's link loss
             self._drop(f"{type(e).__name__}: {e}")
 
     def _poll_scope(self) -> None:
-        waves = self.dev.waveform(self.mask)
-        if waves[0].frame_id != self._last_fid:
-            self._last_fid = waves[0].frame_id
+        mask = self.mask                    # read once: the GUI thread may change it
+        waves = self.dev.waveform(mask)
+        key = (waves[0].frame_id, mask)
+        if key != self._last_key:
+            self._last_key = key
             self.stats["frames"] += 1
             self.frame.emit(ScopeFrame.from_waves(waves, time.time()))
         else:
             self._pause(self.idle_s)
 
     def _get_description(self) -> None:
-        """Once per connection. A NAK means firmware before stage-086."""
+        """Once per connection. A NAK means firmware before stage-086; a bad
+        reply (ProtocolError) is treated the same, so a description that cannot
+        be parsed does not block every poll after it (review Q-6)."""
         fn = getattr(self.dev, "description", None)
         if fn is None:
             self._need_desc = False
@@ -281,10 +310,10 @@ class Worker(QtCore.QThread):
             return
         try:
             d = fn()
-        except Nak as e:
+        except (Nak, proto.ProtocolError) as e:
             self._need_desc = False
-            self.note.emit(f"no device description on this firmware "
-                           f"({proto.ERRORS.get(e.code, hex(e.code))})")
+            why = proto.ERRORS.get(e.code, hex(e.code)) if isinstance(e, Nak) else f"bad reply: {e}"
+            self.note.emit(f"no device description on this firmware ({why})")
             self.description.emit(None)
             return
         self._need_desc = False
@@ -358,9 +387,14 @@ class Worker(QtCore.QThread):
                 name = proto.ERRORS.get(e.code, hex(e.code))
                 what = f"{arg[0]} " if job == "set" else ""
                 self.job_done.emit(job, False, f"{what}refused: {name}: {proto.NAK_HINTS.get(name, '')}".rstrip(": "))
-            except (DeviceError, OSError) as e:
-                # Not a link loss by itself: the next STATUS poll decides that.
+            except Exception as e:
+                # Every job reports (review Q-5: a non-ASCII shell line raised
+                # UnicodeEncodeError and the job never ended). A link loss then
+                # goes on to step(), which drops the device; any other error
+                # leaves the link up and the next STATUS poll decides.
                 self.job_done.emit(job, False, f"{type(e).__name__}: {e}")
+                if link_lost(e):
+                    raise
 
     def _info_job(self) -> None:
         version = self.dev.ping()
@@ -384,7 +418,7 @@ class Worker(QtCore.QThread):
                 if self.dev.scope_state().running:
                     self.dev.run_stop(False)
                     held = True
-            s = self.dev.screenshot()
+            s = self.dev.screenshot(cancel=self._halt.is_set)     # a close stops the dump
         finally:
             if held:
                 self.dev.run_stop(True)     # a failed dump must not leave the scope stopped
