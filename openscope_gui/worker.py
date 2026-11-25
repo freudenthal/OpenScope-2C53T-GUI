@@ -38,6 +38,17 @@ once, and every loss goes through a new connect and a new description (a
 reboot or a reflash can change it). Each job always emits `job_done`, also
 for an unexpected error; a job error that is a link loss then drops the
 device. A busy port stays "searching" with the reason as the detail.
+
+Stage-210: the worker reports firmware compatibility (`compat`, a
+labels.Compat): at connect the section 7 API level; when the open fails
+because the binary protocol does not answer, one firmware probe
+(update.probe_firmware) tells an old shell-only image; while no port is
+found, a drive poll every `drive_s` tells an IAP drive (upgrade mode) or the
+stock firmware's USB Sharing drive. The poll only lists the drives (library
+iapdrive.list_drives); it never opens a file on a drive. Offline (the update
+wizard sets it) the worker sends nothing and polls nothing; `offline_done` is
+set once the device is closed and the port is free. `backup()` runs
+calbackup.make_backup() on the worker's Device.
 """
 from __future__ import annotations
 
@@ -53,6 +64,8 @@ from PySide6 import QtCore
 from openscope import proto
 from openscope.device import Device, DeviceError, Nak, Timeout
 from openscope.link import NoDevice
+
+from .labels import Compat
 
 MODE_SCOPE, MODE_METER = 0, 1
 
@@ -128,12 +141,17 @@ class Worker(QtCore.QThread):
     set_done = QtCore.Signal(str, bool)     # setting name, ok (after each set job)
     info = QtCore.Signal(object)            # dict for the device information dialog
     shell_out = QtCore.Signal(str, str)     # command, output (or the error text)
+    compat = QtCore.Signal(object)          # labels.Compat (stage-210), on each change
+    backup_progress = QtCore.Signal(str, int, int)   # part ("cal"), done, total
+    backup_result = QtCore.Signal(object)   # dict: folder, uid, crc32s, verified, problems; or error
 
     MAX_TIMEOUTS = 3        # consecutive request timeouts before the link counts as lost
 
     def __init__(self, opener: Callable[[], Device] = Device.open, *,
                  status_s: float = 0.5, retry_s: float = 1.0, idle_s: float = 0.03,
-                 meter_s: float = 0.1, nak_s: float = 0.15,
+                 meter_s: float = 0.1, nak_s: float = 0.15, drive_s: float = 2.0,
+                 drive_probe: Optional[Callable[[], list]] = None,
+                 firmware_probe: Optional[Callable[[Optional[str]], str]] = None,
                  clock: Callable[[], float] = time.monotonic, parent=None):
         super().__init__(parent)
         self._opener = opener
@@ -157,6 +175,15 @@ class Worker(QtCore.QThread):
         self.port: Optional[str] = None     # None = automatic (VID:PID); read by the opener
         self.online = True                  # False = stay disconnected (Device > Disconnect)
         self.stats = {"frames": 0, "meter": 0, "naks": 0, "connects": 0, "losses": 0}
+        self.drive_s = drive_s
+        self._drive_probe = drive_probe if drive_probe is not None else default_drive_probe
+        self._firmware_probe = firmware_probe if firmware_probe is not None else default_firmware_probe
+        self._last_drive_poll = -1e9
+        self._probed = False                # firmware probe done since the last NoDevice / connect
+        self._compat: Optional[Compat] = None
+        self._compat_api: Optional[tuple] = None    # (api level or None) to report with the next STATUS
+        self.offline_done = threading.Event()   # set: offline, device closed, port free
+        self._backup_cancel = threading.Event()
 
     # ── called from the GUI thread ────────────────────────────────
     def set_channels(self, mask: int) -> None:
@@ -186,7 +213,23 @@ class Worker(QtCore.QThread):
         self._jobs.put(("reconnect", None))
 
     def set_online(self, on: bool) -> None:
+        if on:
+            self.offline_done.clear()
         self.online = on
+
+    def is_offline(self) -> bool:
+        """True once the worker sends nothing and the port is free (also for a
+        worker thread that does not run)."""
+        return not self.online and (self.offline_done.is_set() or not self.isRunning())
+
+    def backup(self, root=None) -> None:
+        """Queue a calibration backup (calbackup.make_backup) into `root`
+        (None = the library default folder)."""
+        self._backup_cancel.clear()
+        self._jobs.put(("backup", root))
+
+    def cancel_backup(self) -> None:
+        self._backup_cancel.set()
 
     def request_info(self) -> None:
         self._jobs.put(("info", None))
@@ -228,6 +271,7 @@ class Worker(QtCore.QThread):
                 self.stats["losses"] += 1
                 self._set_state("disconnected", why)
         self.mode = None
+        self._compat = self._compat_api = None      # the next connect or drive poll reports again
 
     def step(self) -> None:
         if not self.online:
@@ -235,6 +279,8 @@ class Worker(QtCore.QThread):
                 self._drop(None)
             self._fail_queued_jobs("disconnected by the user")
             self._set_state("offline", "")
+            self._compat = None             # a new connect reports again
+            self.offline_done.set()
             self._pause(self.retry_s)
             return
         if self.dev is None:
@@ -243,8 +289,10 @@ class Worker(QtCore.QThread):
                 self.dev = self._opener(self.port) if self.port else self._opener()
             except Exception as e:          # NoDevice, busy port, version refusal
                 self._set_state("searching", str(e))
+                self._no_port(e)
                 self._pause(self.retry_s)
                 return
+            self._probed = False
             self.stats["connects"] += 1
             self._last_status, self._last_key, self._last_uc, self._timeouts = -1e9, None, None, 0
             self.has_state = None
@@ -261,6 +309,9 @@ class Worker(QtCore.QThread):
                 self._last_status = self._clock()
                 self.mode = st.mode
                 self.status.emit(st)
+                if self._compat_api is not None:     # stage-210: API level + firmware text
+                    self._emit_compat(Compat("binary", self._compat_api[0], st.fw_version))
+                    self._compat_api = None
                 self._poll_state()
             if self.paused:
                 self._pause(self.idle_s)
@@ -288,6 +339,33 @@ class Worker(QtCore.QThread):
         except Exception as e:              # DeviceError, NoDevice (port lost), OSError, a job's link loss
             self._drop(f"{type(e).__name__}: {e}")
 
+    def _emit_compat(self, c: Compat) -> None:
+        if c != self._compat:
+            self._compat = c
+            self.compat.emit(c)
+
+    def _no_port(self, e: BaseException) -> None:
+        """The open failed. No port: poll the drives every drive_s. A port
+        whose binary protocol does not answer: probe the firmware once."""
+        if isinstance(e, NoDevice) and not port_busy(str(e)):
+            self._probed = False
+            if self._clock() - self._last_drive_poll < self.drive_s:
+                return
+            self._last_drive_poll = self._clock()
+            try:
+                kinds = {getattr(d, "kind", "") for d in self._drive_probe()}
+            except Exception:
+                kinds = set()
+            self._emit_compat(Compat("iap") if "IAP" in kinds else
+                              Compat("stock") if "STOCK_SHARING" in kinds else Compat("none"))
+        elif isinstance(e, (Timeout, Nak, proto.ProtocolError)) and not self._probed:
+            self._probed = True
+            try:
+                kind = self._firmware_probe(self.port)
+            except Exception:
+                kind = "none"
+            self._emit_compat(Compat("shell_only") if kind == "shell_only" else Compat("none"))
+
     def _poll_scope(self) -> None:
         mask = self.mask                    # read once: the GUI thread may change it
         waves = self.dev.waveform(mask)
@@ -307,6 +385,7 @@ class Worker(QtCore.QThread):
         if fn is None:
             self._need_desc = False
             self.description.emit(None)
+            self._compat_api = (None,)
             return
         try:
             d = fn()
@@ -315,9 +394,12 @@ class Worker(QtCore.QThread):
             why = proto.ERRORS.get(e.code, hex(e.code)) if isinstance(e, Nak) else f"bad reply: {e}"
             self.note.emit(f"no device description on this firmware ({why})")
             self.description.emit(None)
+            self._compat_api = (None,)
             return
         self._need_desc = False
         self.description.emit(d)
+        ident = getattr(d, "identity", None)
+        self._compat_api = (ident.api_level if ident is not None else None,)
 
     def _poll_state(self) -> None:
         """SCOPE_STATE, unless this firmware has shown it has none."""
@@ -375,6 +457,8 @@ class Worker(QtCore.QThread):
                     self._poll_state()
                 elif job == "info":
                     self._info_job()
+                elif job == "backup":
+                    self._backup_job(arg)
                 elif job == "shell":
                     try:
                         out = self.dev.shell(arg, timeout=5.0)
@@ -410,6 +494,24 @@ class Worker(QtCore.QThread):
                         "status": st, "state": state, "description": desc})
         self.job_done.emit("info", True, "")
 
+    def _backup_job(self, root) -> None:
+        from openscope import calbackup as cb
+        try:
+            folder = cb.make_backup(
+                self.dev, root=root,
+                progress=lambda part, done, total: self.backup_progress.emit(part, done, total),
+                cancel=lambda: self._halt.is_set() or self._backup_cancel.is_set())
+        except Exception as e:
+            self.backup_result.emit({"error": f"{type(e).__name__}: {e}"})
+            raise
+        v = cb.verify_backup(folder)
+        info = cb.read_info(folder)
+        self.backup_result.emit({"folder": str(folder), "uid": info["unit"]["uid"],
+                                 "cal_crc32": info["files"][cb.CAL_FILE]["crc32"],
+                                 "block_crc32": info["cal"]["block_crc32"],
+                                 "verified": v.ok, "problems": list(v.problems)})
+        self.job_done.emit("backup", v.ok, "" if v.ok else "; ".join(v.problems))
+
     def _screenshot_job(self, path: str, hold: bool) -> None:
         from openscope.screen import save_png
         held = False
@@ -441,8 +543,24 @@ class Worker(QtCore.QThread):
                 self.set_done.emit(arg[0], False)
             if job == "shell":
                 self.shell_out.emit(arg, f"error: {why}")
+            if job == "backup":
+                self.backup_result.emit({"error": why})
             self.job_done.emit(job, False, why)
 
 
 def proto_button_name(bid: int) -> str:
     return next((k for k, v in proto.BUTTONS.items() if v == bid), str(bid))
+
+
+def default_drive_probe() -> list:
+    """Removable drives, classified (library iapdrive; Windows only)."""
+    import sys
+    if sys.platform != "win32":
+        return []
+    from openscope import iapdrive
+    return iapdrive.list_drives()
+
+
+def default_firmware_probe(port: Optional[str]) -> str:
+    from openscope.update import probe_firmware
+    return probe_firmware(port)

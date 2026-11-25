@@ -11,6 +11,12 @@ old mode).
 
 The window shows the state the unit reports back, never the value it asked
 for. Visible text is in words and units (labels.py); codes are in tooltips.
+
+Stage-210: Device > Back up calibration… and Device > Update firmware… (the
+wizard in update_wizard.py). A banner over the tabs tells the user when the
+firmware needs an update (labels.compat_text of the worker's compat report),
+with one button that opens the wizard. The unit ID and the git revision show
+only in dialogs, never in the main window.
 """
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from openscope import proto
-from . import dialogs, labels
+from . import dialogs, labels, update_wizard
 from .scope_panel import ScopePanel, continuous
 from .views import MeterView, Rate, ScopeView
 from .worker import ScopeFrame, Worker, port_busy
@@ -68,6 +74,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._events = open(events_path, "a", encoding="utf-8") if events_path else None
         self._info_dlg = None
         self._console = None
+        self.wizard = None
         self.ticks = Rate()
 
         # central: settings banner over the mode tabs
@@ -83,9 +90,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.banner = QtWidgets.QLabel(SETTINGS_BANNER)
         self.banner.setStyleSheet("background:#f2994a; color:black; padding:4px; font-weight:bold")
         self.banner.hide()
+        # firmware compatibility banner (stage-210)
+        self.compat: Optional[labels.Compat] = None
+        self._bundled = None                # newest bundled manifest, read once on first use
+        self.compat_banner = QtWidgets.QFrame()
+        self.compat_banner.setStyleSheet("QFrame { background:#f2c94c; } QLabel { color:black; "
+                                         "font-weight:bold; } QPushButton { color:black; background:#fff3c4; "
+                                         "border:1px solid #8a6d00; padding:2px 10px; }")
+        bl = QtWidgets.QHBoxLayout(self.compat_banner)
+        bl.setContentsMargins(6, 3, 6, 3)
+        self.compat_label = QtWidgets.QLabel()
+        self.compat_label.setWordWrap(True)
+        self.compat_button = QtWidgets.QPushButton("Update firmware…")
+        self.compat_button.clicked.connect(self._update_firmware)
+        bl.addWidget(self.compat_label, 1)
+        bl.addWidget(self.compat_button)
+        self.compat_banner.hide()
         central = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(central)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.compat_banner)
         lay.addWidget(self.banner)
         lay.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
@@ -151,6 +175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.description.connect(self._description)
         worker.set_done.connect(self._set_done)
         worker.info.connect(self._info)
+        worker.compat.connect(self._compat)
         self.meter.log_btn.toggled.connect(self._meter_log_toggled)
         self.timer = QtCore.QTimer(self)
         self.timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -216,6 +241,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_connect = self._action("Connect", lambda: self._online(True))
         self.act_disconnect = self._action("Disconnect", lambda: self._online(False))
         self.act_info = self._action("Device information…", self._device_info)
+        self.act_backup = self._action("Back up calibration…", self._backup_cal)
+        self.act_update = self._action("Update firmware…", self._update_firmware)
         self.act_console = self._action("Debug console…", self._debug_console)
         self.act_about = self._action("About", lambda: dialogs.show_about(self, self._fw), "F1")
         for a in (self.act_run, self.act_single):
@@ -239,6 +266,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.port_menu.aboutToShow.connect(self._fill_ports)
         m.addSeparator()
         m.addAction(self.act_info)
+        m.addAction(self.act_backup)
+        m.addAction(self.act_update)
         self.tools_menu = mb.addMenu("&Tools")
         self.tools_menu.addAction(self.act_console)
         self.tools_menu.addAction(self.act_keys)
@@ -346,6 +375,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._unit_mode = None
             self._pending_mode = None
             self.banner.hide()
+            if state == "offline":
+                self.compat_banner.hide()
             self.panel.clear()
             self.scope.clear()                  # no old trace after a reconnect (review Q-10)
             self.panel.set_description(None)
@@ -425,6 +456,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if job == "screenshot":
             self.act_shot.setEnabled(True)
 
+    def bundled_manifest(self):
+        if self._bundled is None:
+            self._bundled = update_wizard.newest_bundled() or False
+        return self._bundled or None
+
+    def _compat(self, c: labels.Compat) -> None:
+        """The worker's compatibility report: banner text and button."""
+        self.compat = c
+        self._event(f"compat {c.kind} api {c.api_level}")
+        t = labels.compat_text(c, self.bundled_manifest())
+        if t is None:
+            self.compat_banner.hide()
+            return
+        self.compat_label.setText(t[0])
+        self.compat_button.setVisible(t[1])
+        self.compat_banner.show()
+
     def _info(self, info: dict) -> None:
         if self._info_dlg is not None:
             self._info_dlg.show_info(info)
@@ -501,6 +549,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._info_dlg.finished.connect(lambda _: setattr(self, "_info_dlg", None))
         self._info_dlg.show()
         self.worker.request_info()
+
+    def _backup_cal(self) -> None:
+        dlg = update_wizard.BackupDialog(self.worker, self._state == "connected", self)
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dlg.show()
+
+    def _update_firmware(self) -> None:
+        self.wizard = update_wizard.UpdateWizard(self.worker, self.compat, self.desc, self._fw, self)
+        self.wizard.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        self.wizard.finished.connect(lambda _: setattr(self, "wizard", None))
+        self.wizard.open()
 
     def _debug_console(self) -> None:
         if self._console is None:

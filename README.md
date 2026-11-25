@@ -40,7 +40,7 @@ package. The GUI needs a firmware build with the same protocol version as the li
   the value it asked for. The Multimeter and Signal generator panels come in later stages.
 * **Menus:** File (Save LCD screenshot, Save waveform as CSV or NPZ, Record meter to CSV, Exit),
   View (Control panel, Unit keys, Show uncalibrated settings, Advanced tools), Device (Connect,
-  Disconnect, Port, Device information), Tools (with Advanced tools: Debug console, which never
+  Disconnect, Port, Device information, Back up calibration, Update firmware), Tools (with Advanced tools: Debug console, which never
   sends `cal restore` or `mem write`), Help (About). Window size, dock layout and View choices
   are kept between runs.
 * **Toolbar and keys:** Run/Stop (Space), Single, Screenshot (Ctrl+P), Save waveform (Ctrl+S),
@@ -57,6 +57,40 @@ options: `--stats CSV` (rates once a second), `--events TXT`, `--meter-log CSV`,
 `--quit-after S`, `--channels 1,2`. One reader thread (`worker.py`) owns the port; a 30 Hz
 timer draws.
 
+## Back up and update
+The library (`openscope` 0.6.0 or later) does the work; the window only guides it.
+
+* **Device ▸ Back up calibration…** reads the unit's calibration page and saves it in a folder
+  per unit (`%LOCALAPPDATA%\OpenScope\backups\<unit ID>\<time>`). The dialog shows the
+  folder, the CRC32 values and the unit ID, and has an "Open folder" button. Copy the folder to
+  a second place: a lost calibration cannot be made again.
+* **Device ▸ Update firmware…** opens a wizard with six pages:
+  1. *Check*: the unit, its firmware and the image. The image comes from the `firmware` folder
+     next to the program (release package) or from the folder in `OPENSCOPE_FIRMWARE_DIR`, or
+     you choose a `.bin` file that has its `.manifest.json` next to it. An image that the checks
+     refuse cannot go on.
+  2. *Backup*: automatic. Next stays off until the backup of this run is verified. On a unit
+     with the FNIRSI firmware (first install) the backup comes after the first OpenScope start:
+     tick the acknowledgment and type `INSTALL`.
+  3. *Upgrade mode*: keep USB connected, hold MENU and tap Power, keep MENU held until the
+     upgrade screen shows. If it does not show: hold MENU, press the pinhole reset, keep MENU
+     held 3 to 5 s. The wizard finds the drive by itself.
+  4. *Copy*: one write of the image (about 11 s). Do not unplug the unit and do not open its
+     drive. This page has no Cancel and the wizard cannot close until the update ends.
+  5. *Restart*: the wizard waits for the unit's port (up to 60 s) and checks it.
+  6. *Result*: the firmware against the manifest, the calibration before and after, and the
+     path of the update log.
+
+  During the update the window does not use the port (the wizard has its own connection). After
+  Finish the window connects again and reads the unit's description again.
+* **Banner:** at connect the window compares the firmware's API level with the level that this
+  program needs. When the firmware is too old, has no build identity, answers on the debug shell
+  only, or when the unit waits in upgrade mode or runs the FNIRSI firmware, a yellow line over
+  the tabs says so, with an "Update firmware…" button. Firmware newer than this program gets a
+  note only.
+* Return to the FNIRSI firmware is a command-line function only: `openscope update
+  --stock-image <file>`.
+
 ## Layers
 | module | job |
 |---|---|
@@ -64,6 +98,7 @@ timer draws.
 | `window.py` | tabs, menus, toolbar, docks |
 | `scope_panel.py` | Oscilloscope control panel |
 | `dialogs.py` | Device information, Debug console, About |
+| `update_wizard.py` | calibration backup dialog, firmware update wizard and its runner thread |
 | `labels.py` | practical-unit text from the unit's description |
 | `views.py` | plots, FFT, cursors, meter strip chart and CSV |
 | `app.py` | entry point (`openscope-gui`) |
@@ -74,6 +109,7 @@ python tests/test_gui_labels.py   # practical-unit text from a real device descr
 python tests/test_gui_worker.py   # reader thread vs a fake Device (skipped without PySide6/numpy)
 python tests/test_gui_views.py    # FFT/period helpers, cursor readout, meter CSV (offscreen Qt)
 python tests/test_gui_app.py      # the window offscreen: tabs = modes, panel, no codes visible, settings kept
+python tests/test_gui_update.py   # banner cases, backup job, the update wizard with a fake flow and drive
 python -m unittest discover -s tests -t tests   # all of them
 ```
 If `openscope` is not installed, the suites find it in `../OpenScope-2C53T/tools/openscope_host`,

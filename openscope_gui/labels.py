@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from openscope import proto
 
@@ -390,7 +390,107 @@ def info_lines(version: str, port: str, st: proto.Status, state: Optional[proto.
             ("Probe settings", ", ".join(f"CH{i + 1} ×{f}" for i, f in enumerate(probe))
              if probe else "not reported by this firmware"),
             ("Description", "received" if desc else "not sent by this firmware")]
+    ident = desc.identity if desc is not None else None
+    if ident is not None:           # section 7 (stage-190): dialogs only, never the main window
+        rows += [("Unit ID", ident.uid_hex),
+                 ("Build target", ident.target),
+                 ("Git revision", ident.git_rev),
+                 ("API level", f"{ident.api_level} (this program needs {REQUIRED_API_LEVEL})")]
+    else:
+        rows.append(("Unit ID", "not reported by this firmware"))
     return rows
+
+
+# ── firmware compatibility (stage-210) ─────────────────────────────────
+# The API level (DESCRIPTION section 7, remote_protocol.md §9.2) that this GUI
+# needs. Firmware with a lower level, or with no section 7, or with the shell
+# only, needs an update.
+REQUIRED_API_LEVEL = 1
+
+UPDATE_NEEDED = "Firmware update needed"
+UPDATE_RECOMMENDED = "Firmware update recommended"
+COMPAT_TEXT = {
+    "api_lower": f"{UPDATE_NEEDED}: the firmware on the unit is older than this program needs.",
+    "no_identity": f"{UPDATE_NEEDED}: the firmware on the unit does not identify its build to "
+                   "this program.",
+    "shell_only": f"{UPDATE_NEEDED}: the firmware on the unit has no binary link for this program.",
+    "iap": f"The unit waits in upgrade mode. {UPDATE_NEEDED}.",
+    "stock": "The unit runs the FNIRSI firmware. Install OpenScope to use this program.",
+    "api_higher": "This program is older than the firmware on the unit. Some functions can be "
+                  "missing; get a newer program.",
+    "recommended": f"{UPDATE_RECOMMENDED}: newer firmware comes with this program.",
+}
+
+
+@dataclass(frozen=True)
+class Compat:
+    """What the worker found about the firmware at connect, or about the
+    drives while no port is found.
+
+    kind: "binary" (connected), "shell_only" (an old OpenScope image: the
+    shell answers, the binary protocol does not), "iap" (an IAP drive and no
+    port: the unit waits in upgrade mode), "stock" (the stock firmware's USB
+    Sharing drive and no port), "none" (nothing found)."""
+    kind: str
+    api_level: Optional[int] = None     # binary: section 7 API level; None = no section 7
+    fw_version: str = ""                # binary: the STATUS firmware text
+
+
+_BUILD = re.compile(r"OpenScope ([A-Z][a-z]{2}) +(\d{1,2}) (\d{4}) (\d\d:\d\d:\d\d)")
+
+
+def build_time(text: Optional[str]):
+    """The build time in a firmware text or a manifest build time
+    ("Nov 25 2026 23:12:35"; __DATE__ pads the day with a space), as a
+    datetime; None if there is none."""
+    from datetime import datetime
+    if not text:
+        return None
+    m = _BUILD.search(text if text.startswith("OpenScope") else "OpenScope " + text)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(f"{m.group(1)} {int(m.group(2))} {m.group(3)} {m.group(4)}",
+                                 "%b %d %Y %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def bundled_is_newer(c: Compat, bundled) -> bool:
+    """ASSUMPTION rule (stage-210): the bundled image is newer when its
+    manifest has the same API level as the running firmware and a later build
+    time than the running firmware text."""
+    if bundled is None or c.kind != "binary" or c.api_level is None:
+        return False
+    if bundled.api_level != c.api_level:
+        return False
+    mine, theirs = build_time(c.fw_version), build_time(bundled.build_time)
+    return mine is not None and theirs is not None and theirs > mine
+
+
+def compat_case(c: Optional[Compat], bundled=None, required: int = REQUIRED_API_LEVEL) -> Optional[str]:
+    """The banner case (a COMPAT_TEXT key), or None for no banner."""
+    if c is None or c.kind == "none":
+        return None
+    if c.kind in ("shell_only", "iap", "stock"):
+        return c.kind
+    if c.api_level is None:
+        return "no_identity"
+    if c.api_level < required:
+        return "api_lower"
+    if c.api_level > required:
+        return "api_higher"
+    return "recommended" if bundled_is_newer(c, bundled) else None
+
+
+def compat_text(c: Optional[Compat], bundled=None,
+                required: int = REQUIRED_API_LEVEL) -> Optional[Tuple[str, bool]]:
+    """(banner text, offer the update wizard) or None for no banner. Pure.
+    Firmware newer than this GUI gets a note only (no wizard)."""
+    case = compat_case(c, bundled, required)
+    if case is None:
+        return None
+    return COMPAT_TEXT[case], case != "api_higher"
 
 
 def fmt_duration(s: float) -> str:
@@ -411,6 +511,7 @@ NOTE_WORDS = {
     "UNSUPPORTED": "This firmware does not do that",
 }
 _HEX = re.compile(r"0x[0-9A-Fa-f]+")
+_UID = re.compile(r"\b[0-9A-Fa-f]{24}\b")      # a unit ID (stage-210: dialogs only)
 
 
 def note_words(text: str) -> str:
@@ -424,7 +525,7 @@ def note_words(text: str) -> str:
         return "No reply from the unit"
     if low.startswith("protocol"):
         return "Bad reply from the unit; trying again"
-    return _HEX.sub("…", text)
+    return _UID.sub("…", _HEX.sub("…", text))
 
 
 SET_WORDS = {"mode": "Unit mode", "timebase": "Timebase", "vdiv": "Volts/div", "trigger": "Trigger",
@@ -446,8 +547,54 @@ def job_words(job: str, ok: bool, msg: str) -> str:
         return f"Screenshot saved: {msg.split(' (')[0]}" if ok else f"Screenshot failed: {note_words(msg)}"
     if job == "press":
         return "Key press sent" if ok else f"Key press failed: {note_words(msg)}"
+    if job == "backup":
+        return "Calibration backup saved" if ok else f"Calibration backup failed: {note_words(msg)}"
     return f"{job} {'done' if ok else 'failed'}"
 
 
 def mode_label_items(modes: Sequence[int] = (0, 1, 2)) -> List[str]:
     return [MODE_WORDS[m] for m in modes]
+
+
+# ── backup dialog and update wizard texts (stage-210) ──────────────────
+# The wizard pages are dialogs: they can name unit keys (MENU, Power).
+WIZ = {
+    "check_sub": "The unit, its firmware and the image that this wizard will install.",
+    "no_unit": "No unit found. Connect the unit with USB. The page updates by itself.",
+    "no_image": "No image. Choose an image (a .bin file with its .manifest.json next to it).",
+    "backup_sub": "A verified backup of the calibration of this unit must exist before the copy.",
+    "backup_running": "Backing up the calibration of this unit. Do not disconnect the unit.",
+    "backup_disk": "The unit is in upgrade mode. Looking for an earlier backup of this unit on this "
+                   "computer.",
+    "backup_verified": "The backup is verified. Push Next and put the unit in upgrade mode.",
+    "backup_ok": "The backup is saved and verified.",
+    "backup_reminder": "Copy this folder to a second place (a USB stick or cloud storage). A lost "
+                       "calibration cannot be made again.",
+    "backup_not_connected": "The unit is not connected. Connect the unit and try again. For an old "
+                            "firmware that this program cannot connect to, use Device > Update "
+                            "firmware… (it backs up first).",
+    "first_sub": "First install from the FNIRSI firmware. The backup comes after the first OpenScope "
+                 "start, because the FNIRSI firmware cannot send the calibration.",
+    "first_ack": "This unit is a FNIRSI 2C53T (see the label). I copied the files that I want to keep. "
+                 "I will not press a key until this wizard says that the backup is done.",
+    "enter_sub": "Put the unit in upgrade mode. The wizard finds the unit by itself.",
+    "enter_openscope": "Keep USB connected. Hold MENU and tap Power. Keep MENU held until the "
+                       "upgrade screen shows.\nIf it does not show: hold MENU, press the pinhole "
+                       "reset with a pin, and keep MENU held for 3 to 5 s.\nDo not open the drive "
+                       "of the unit in Explorer.",
+    "enter_stock": "Keep USB connected. Hold MENU and tap Power. Keep MENU held until the upgrade "
+                   "screen shows.\nDo not open the drive of the unit in Explorer.",
+    "enter_c_sub": "The unit is in upgrade mode already.",
+    "enter_c": "The unit waits in upgrade mode. The copy starts next.",
+    "enter_waiting": "Waiting for the unit in upgrade mode…",
+    "copy_sub": "The image goes to the unit in one write.",
+    "copy_warn": "Do not unplug the unit. Do not open the drive of the unit.",
+    "reboot_sub": "The unit programs the image and starts again. Then the wizard checks the firmware "
+                  "and the calibration.",
+    "ok": "The update is complete.",
+    "problems": "The image was copied, but the check found differences.",
+    "refused": "The update did not start. Nothing was written to the unit.",
+    "cancelled": "Cancelled. Nothing was written to the unit.",
+    "failed_before": "The update stopped before the copy. Nothing was written to the unit.",
+    "failed_copied": "The image was copied, but the update did not finish. Read the text below.",
+}

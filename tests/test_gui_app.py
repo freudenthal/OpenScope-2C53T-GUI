@@ -373,6 +373,28 @@ class TestNoCodesVisible(WindowCase):
         self.assertEqual([t for t in texts if KEY_NAME.search(t)], [])
         self.assertTrue(any("2.56 ms/div" in t for t in texts))
 
+    def test_no_unit_id_or_git_revision_in_the_main_window(self):
+        # stage-210: section 7 shows only in dialogs (device information, backup,
+        # update). A unit ID or a git revision has no "0x": check them by value.
+        ident = proto.Identity(bytes(range(12)), 1, "guest-coldtrace", "cb8a172")
+        desc = proto.Description(**{**{f: getattr(self.desc, f) for f in self.desc.__dataclass_fields__},
+                                    "identity": ident})
+        w = self.win
+        w._set_conn("connected", "COMFAKE")
+        w._description(desc)
+        w._status(status())
+        w._scope_state(state())
+        w._frame(frame())
+        from openscope_gui.labels import Compat
+        for c in (Compat("binary", 0, "OpenScope Nov 25 2026 23:12:35 cb8a172"), Compat("shell_only")):
+            w.worker.compat.emit(c)
+            texts = self.visible_texts() + [w.compat_label.text()]
+            self.assertTrue(w.compat_banner.isVisibleTo(w))
+            for value in (ident.uid_hex, ident.git_rev, ident.usb_serial):
+                self.assertEqual([t for t in texts if value in t], [], value)
+            self.assertEqual([t for t in texts if HEX.search(t)], [])
+            self.assertEqual([t for t in texts if KEY_NAME.search(t)], [])
+
     def test_keys_dock_shows_key_names_only_when_asked(self):
         self.assertTrue(self.win.keys_dock.isHidden())
         self.win.act_keys.trigger()        # a menu click
