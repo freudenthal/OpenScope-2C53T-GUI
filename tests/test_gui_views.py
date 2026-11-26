@@ -238,5 +238,69 @@ class TestViews(unittest.TestCase):
         self.assertTrue(m.redraw())
 
 
+@unittest.skipUnless(HAVE_QT, "PySide6/numpy/pyqtgraph not installed (pip install -e .[gui])")
+class TestMeterStage260(unittest.TestCase):
+    """MeterModel apart from MeterView; Q-7 (blank shows grey with its age) and
+    Q-8 (the log appends under one header)."""
+    setUpClass = TestViews.setUpClass
+
+    @staticmethod
+    def sample(uc, t, val=3.254):
+        return MeterSample(t, proto.MeterReading(uc, val, 0, 3, 1, 0, 0, 0, "V", f"{val}"))
+
+    def test_q8_two_logs_on_one_file_append_under_one_header(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.csv")
+            for run in range(2):                        # two launches with --meter-log m.csv
+                m = views.MeterView()
+                m.start_log(path)
+                for i in range(3):
+                    m.add(self.sample(run * 10 + i, 1000.0 + run * 10 + i))
+                m.stop_log()
+            with open(path, newline="") as f:
+                rows = list(csv.reader(f))
+        self.assertEqual(rows[0], views.CSV_HEADER)
+        self.assertEqual(sum(1 for r in rows if r == views.CSV_HEADER), 1)
+        self.assertEqual([r[1] for r in rows[1:]], ["0", "1", "2", "10", "11", "12"])
+
+    def test_q7_blank_period_is_grey_with_its_age_then_live_again(self):
+        m = views.MeterView()
+        now = 1000.0
+        m.add(self.sample(1, now))
+        self.assertEqual(m.big.styleSheet(), views.MeterView.LIVE_STYLE)
+        m.set_blank(True)                               # the worker's meter_blank event
+        self.assertEqual(m.big.styleSheet(), views.MeterView.BLANK_STYLE)
+        self.assertEqual(m.big.text(), "3.254 V")       # the last value stays, in grey
+        m._show_age(now + 4.2)
+        self.assertEqual(m.age.text(), "last reading 4 s ago")
+        self.assertAlmostEqual(m.model.age(now + 4.2), 4.2)
+        m.add(self.sample(2, now + 5))                  # a new reading: normal colour, no age
+        self.assertFalse(m.blank)
+        self.assertEqual(m.big.styleSheet(), views.MeterView.LIVE_STYLE)
+        self.assertEqual(m.age.text(), "")
+
+    def test_blank_before_any_reading_says_so(self):
+        m = views.MeterView()
+        m.set_blank(True)
+        self.assertEqual(m.age.text(), "no reading yet")
+        m.set_blank(False)                              # meter_ok
+        self.assertEqual((m.age.text(), m.big.styleSheet()), ("", views.MeterView.LIVE_STYLE))
+
+    def test_clear_empties_value_chart_and_age(self):
+        m = views.MeterView()
+        m.add(self.sample(1, 1000.0))
+        m.set_blank(True)
+        m.clear()
+        self.assertEqual((m.big.text(), m.info.text(), m.age.text()), ("—", "", ""))
+        self.assertEqual((list(m.ts), list(m.vs), m.model.last, m.blank), ([], [], None, False))
+        self.assertEqual(m.big.styleSheet(), views.MeterView.LIVE_STYLE)
+
+    def test_model_works_without_a_widget(self):
+        mm = views.MeterModel()
+        self.assertTrue(mm.add(self.sample(1, 5.0)))
+        self.assertFalse(mm.add(MeterSample(6.0, proto.MeterReading(2, 0.0, 0, 3, 6, 0, 0, 0, "V", ""))))
+        self.assertEqual((list(mm.vs), mm.last.reading.update_count, mm.last_t), ([3.254], 2, 6.0))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,8 @@ if HAVE_QT:
     from PySide6 import QtCore, QtGui, QtTest, QtWidgets
     from openscope_gui.app import MainWindow  # noqa: E402
     from openscope_gui.window import PORT_BUSY_TEXT, SETTINGS_BANNER  # noqa: E402
-    from openscope_gui.worker import ScopeFrame, Worker, shell_refused  # noqa: E402
+    from openscope_gui.worker import Event, MeterSample, ScopeFrame, Worker, shell_refused  # noqa: E402
+    from openscope_gui.panels import Panel, PlaceholderPanel  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_gui_labels import REAL_DESCRIPTION  # noqa: E402
@@ -359,6 +360,21 @@ class TestScopePanel(WindowCase):
         self.assertEqual(p.level(), 10)
         self.assertAlmostEqual(sb.value(), p._lscale.value(10), places=sb.decimals())
 
+    def test_enter_then_focus_out_sends_one_set(self):
+        # stage-260 EditSender: Enter and the focus out after it are one edit
+        self.connect(st=state(level=10))
+        p, sb = self.win.panel, self.win.panel.level_sb
+        self.win.activateWindow()
+        sb.setFocus()
+        self.app.processEvents()
+        sb.selectAll()
+        QtTest.QTest.keyClicks(sb, f"{p._lscale.value(-25):.{sb.decimals()}f}")
+        QtTest.QTest.keyClick(sb, QtCore.Qt.Key_Return)
+        p.tb_cb.setFocus()                                      # focus out before the state comes back
+        self.app.processEvents()
+        sb.editingFinished.emit()
+        self.assertEqual(self.jobs(), [("set", ("trigger", ("auto", "rising", "CH1", -25)))])
+
     def test_uncalibrated_items_hidden_by_default(self):
         self.connect()
         p = self.win.panel
@@ -581,6 +597,73 @@ class TestStage180Window(WindowCase):
         self.assertTrue(w._stats_f.closed and w._events.closed)
         with open(events, encoding="utf-8") as f:
             self.assertIn("closed", f.read())
+
+
+class TestStage260Window(WindowCase):
+    """The panel dict, the disconnect loop, the placeholders, event routing."""
+
+    def reading(self, uc=1):
+        return MeterSample(1000.0, proto.MeterReading(uc, 3.254, 0, 3, 1, 0, 0, 0, "V", "3.254"))
+
+    def test_one_panel_per_tab_in_the_stack(self):
+        w = self.win
+        self.assertEqual(sorted(w.panels), [0, 1, 2])
+        self.assertIs(w.panels[0], w.panel)
+        for mode, p in w.panels.items():
+            self.assertIsInstance(p, Panel)
+            self.assertIs(w.stack.widget(mode), p)
+            self.assertEqual(p.mode, mode)
+
+    def test_placeholders_name_stages_275_and_285(self):
+        self.assertIsInstance(self.win.panels[1], PlaceholderPanel)
+        self.assertIn("stage 275", self.win.panels[1].text())
+        self.assertIn("stage 285", self.win.panels[2].text())
+        self.assertIn("stage 285", self.win.gen_view.findChild(QtWidgets.QLabel).text())
+        texts = " ".join(l.text() for l in self.win.findChildren(QtWidgets.QLabel))
+        self.assertNotRegex(texts, r"stage 08[89]")
+
+    def test_disconnect_clears_all_panels_and_the_meter(self):
+        self.connect(mode=1)
+        cleared = []
+        for p in self.win.panels.values():
+            p.clear = (lambda p=p: cleared.append(p.mode))
+        self.win.meter.add(self.reading())
+        self.win._worker_event(Event("meter_blank", False, "NOT_READY"))
+        self.win._set_conn("disconnected", "NoDevice: port lost")
+        self.assertEqual(sorted(cleared), [0, 1, 2])
+        m = self.win.meter
+        self.assertEqual((m.big.text(), list(m.vs), m.blank, m.age.text()), ("—", [], False, ""))
+
+    def test_state_updates_to_every_panel_send_nothing(self):
+        self.connect(mode=0)
+        for p in self.win.panels.values():
+            p.set_description(self.desc)
+        self.win.panels[0].set_state(state(level=20))
+        self.win.panels[1].set_state(object())
+        self.win.panels[2].set_state(object())
+        self.assertEqual(self.jobs(), [])
+
+    def test_meter_events_grey_the_value_and_go_to_the_events_log(self):
+        events = os.path.join(self.tmp, "events.txt")
+        w = MainWindow(self.worker, events_path=events,
+                       settings=QtCore.QSettings(self.ini, QtCore.QSettings.IniFormat))
+        self._wins = [w]
+        w.meter.add(self.reading())
+        w._worker_event(Event("meter_blank", False, "NOT_READY"))
+        self.assertTrue(w.meter.blank)
+        self.assertEqual(w.meter.big.styleSheet(), w.meter.BLANK_STYLE)
+        w._worker_event(Event("nak", False, "NO_CAPTURE_DATA"))    # other kinds: no change
+        self.assertTrue(w.meter.blank)
+        w._worker_event(Event("meter_ok", True))
+        self.assertFalse(w.meter.blank)
+        w._note("meter blank: NOT_READY")
+        self.assertIn("no reading yet", w.sb_note.text())
+        w._events.close()
+        w._events = None
+        with open(events, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual([l.split(" ", 2)[2] for l in lines if " event " in l],
+                         ["event meter_blank NOT_READY", "event meter_ok"])
 
 
 if __name__ == "__main__":

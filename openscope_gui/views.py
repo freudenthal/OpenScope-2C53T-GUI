@@ -5,10 +5,14 @@ Honesty rules carried over from the library: samples are raw ADC counts
 and frequency are shown only when the frame carries a sample rate, otherwise
 the axis is in samples. Samples [0, head_skip) are the record-head defect and
 are shaded and left out of every measurement.
+
+Stage-260: the meter is a MeterModel (data, blank state, CSV log) and a
+MeterView (the widget that draws from it).
 """
 from __future__ import annotations
 
 import csv
+import os
 import time
 from collections import deque
 from typing import Optional
@@ -314,20 +318,106 @@ CSV_HEADER = ["t_unix", "update_count", "value", "unit", "display", "raw_bcd", "
               "result", "submode", "ac", "autorange", "hold"]
 
 
-class MeterView(QtWidgets.QWidget):
+class MeterModel:
+    """The meter data, apart from its widget (stage-260): history, the last
+    reading and its time, the blank state, and the CSV log.
+
+    Every received reading is logged, whatever the display shows. The log
+    appends: `start_log()` writes the header only to an empty file, so a
+    restart with the same name keeps the earlier rows (review Q-8). A blank
+    period (NAK NOT_READY) adds no CSV row; the --events log has its start and
+    end."""
     HISTORY = 1200
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(self):
         self.t0: Optional[float] = None
         self.ts: deque = deque(maxlen=self.HISTORY)
         self.vs: deque = deque(maxlen=self.HISTORY)
         self.unit = ""
+        self.last: Optional[MeterSample] = None
+        self.last_t: Optional[float] = None     # time.time() of the last reading
+        self.blank = False
         self.log_file = None
         self.log_writer = None
         self.logged = 0
+
+    def add(self, s: MeterSample) -> bool:
+        """Store and log one reading. True if the chart got a point."""
+        m = s.reading
+        self.last, self.last_t, self.blank = s, s.t_unix, False
+        point = m.result == "normal"
+        if point:
+            if m.unit != self.unit:
+                if self.unit:
+                    self.clear_chart()          # a unit change starts a new chart
+                self.unit = m.unit
+            if self.t0 is None:
+                self.t0 = s.t_unix
+            self.ts.append(s.t_unix - self.t0)
+            self.vs.append(m.value)
+        if self.log_writer:
+            self.log_writer.writerow([f"{s.t_unix:.3f}", m.update_count, m.value, m.unit,
+                                      m.display, m.raw_bcd, m.decimal_pos, m.result, m.submode,
+                                      int(m.ac), int(m.autorange), int(m.hold)])
+            self.log_file.flush()
+            self.logged += 1
+        return point
+
+    def set_blank(self, on: bool) -> None:
+        self.blank = on
+
+    def age(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds since the last reading (None: no reading)."""
+        if self.last_t is None:
+            return None
+        return max(0.0, (time.time() if now is None else now) - self.last_t)
+
+    def clear_chart(self) -> None:
+        self.ts.clear()
+        self.vs.clear()
+        self.t0 = None
+
+    def clear(self) -> None:
+        """No unit: no value, no chart, no age. The log stays open."""
+        self.clear_chart()
+        self.unit = ""
+        self.last = self.last_t = None
+        self.blank = False
+
+    def start_log(self, path: str) -> None:
+        self.stop_log()
+        self.log_file = open(path, "a", newline="")
+        self.log_writer = csv.writer(self.log_file)
+        if os.fstat(self.log_file.fileno()).st_size == 0:
+            self.log_writer.writerow(CSV_HEADER)
+            self.log_file.flush()
+        self.logged = 0
+
+    def stop_log(self) -> None:
+        if self.log_file:
+            self.log_file.close()
+        self.log_file = self.log_writer = None
+
+
+def age_words(age: Optional[float]) -> str:
+    if age is None:
+        return "no reading yet"
+    return f"last reading {age:.0f} s ago"
+
+
+class MeterView(QtWidgets.QWidget):
+    """The meter widget: draws from its MeterModel. During a blank period the
+    value is grey and the line under it gives its age (review Q-7)."""
+    HISTORY = MeterModel.HISTORY
+    LIVE_STYLE = ""
+    BLANK_STYLE = "color:#8a8a8a"
+
+    def __init__(self, parent=None, model: Optional[MeterModel] = None):
+        super().__init__(parent)
+        self.model = model if model is not None else MeterModel()
         self.updates = Rate(5.0)
         self._dirty = False
+        self._age_text = ""
 
         self.big = QtWidgets.QLabel("—")
         fnt = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
@@ -336,6 +426,8 @@ class MeterView(QtWidgets.QWidget):
         self.big.setAlignment(QtCore.Qt.AlignCenter)
         self.info = QtWidgets.QLabel("")
         self.info.setAlignment(QtCore.Qt.AlignCenter)
+        self.age = QtWidgets.QLabel("")
+        self.age.setAlignment(QtCore.Qt.AlignCenter)
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", "time (s)")
@@ -356,62 +448,89 @@ class MeterView(QtWidgets.QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.big)
         lay.addWidget(self.info)
+        lay.addWidget(self.age)
         lay.addWidget(self.plot, 1)
         lay.addLayout(row)
+
+    # the model's data, under the names the window and the tests use
+    @property
+    def ts(self) -> deque:
+        return self.model.ts
+
+    @property
+    def vs(self) -> deque:
+        return self.model.vs
+
+    @property
+    def log_file(self):
+        return self.model.log_file
+
+    @property
+    def blank(self) -> bool:
+        return self.model.blank
 
     def add(self, s: MeterSample) -> None:
         m = s.reading
         self.updates.tick()
-        valid = m.result == "normal"
+        unit = self.model.unit
+        if self.model.add(s):
+            self._dirty = True
+        if self.model.unit != unit:
+            self.plot.setLabel("left", f"reading ({self.model.unit})")
         self.big.setText(f"{m.display} {m.unit}".strip() if m.display.strip() else "—")
+        self.big.setStyleSheet(self.LIVE_STYLE)
         flags = [x for x, on in (("AC", m.ac), ("AUTO", m.autorange), ("HOLD", m.hold)) if on]
         self.info.setText(f"#{m.update_count}  {m.result}  {' '.join(flags)}  "
                           f"value {m.value:g} {m.unit}")
-        if valid:
-            if m.unit != self.unit:
-                if self.unit:
-                    self.clear_chart()          # a unit change starts a new chart
-                self.unit = m.unit
-                self.plot.setLabel("left", f"reading ({m.unit})")
-            if self.t0 is None:
-                self.t0 = s.t_unix
-            self.ts.append(s.t_unix - self.t0)
-            self.vs.append(m.value)
-            self._dirty = True
-        if self.log_writer:
-            self.log_writer.writerow([f"{s.t_unix:.3f}", m.update_count, m.value, m.unit,
-                                      m.display, m.raw_bcd, m.decimal_pos, m.result, m.submode,
-                                      int(m.ac), int(m.autorange), int(m.hold)])
-            self.log_file.flush()
-            self.logged += 1
-            self.log_label.setText(f"logging: {self.logged} rows → {self.log_file.name}")
+        self._show_age()
+        if self.model.log_writer:
+            self.log_label.setText(f"logging: {self.model.logged} rows → {self.model.log_file.name}")
+
+    def set_blank(self, on: bool) -> None:
+        """The worker's meter_blank (on) / meter_ok (off) event."""
+        self.model.set_blank(on)
+        self.big.setStyleSheet(self.BLANK_STYLE if on else self.LIVE_STYLE)
+        self._show_age()
+
+    def _show_age(self, now: Optional[float] = None) -> None:
+        text = age_words(self.model.age(now)) if self.model.blank else ""
+        if text != self._age_text:              # the label changes about once a second
+            self._age_text = text
+            self.age.setText(text)
 
     def redraw(self) -> bool:
+        if self.model.blank:
+            self._show_age()
         if not self._dirty:
             return False
         self._dirty = False
-        self.curve.setData(list(self.ts), list(self.vs))
+        self.curve.setData(list(self.model.ts), list(self.model.vs))
         return True
 
     def clear_chart(self) -> None:
-        self.ts.clear()
-        self.vs.clear()
-        self.t0 = None
+        self.model.clear_chart()
         self.curve.setData([], [])
 
+    def clear(self) -> None:
+        """Disconnect: empty the value, the chart and the age."""
+        self.model.clear()
+        self.big.setText("—")
+        self.big.setStyleSheet(self.LIVE_STYLE)
+        self.info.setText("")
+        self._show_age()
+        self.plot.setLabel("left", "reading")
+        self.curve.setData([], [])
+        self._dirty = False
+
     def start_log(self, path: str) -> None:
-        self.stop_log()
-        self.log_file = open(path, "w", newline="")
-        self.log_writer = csv.writer(self.log_file)
-        self.log_writer.writerow(CSV_HEADER)
-        self.logged = 0
+        self.model.start_log(path)
         self.log_label.setText(f"logging → {path}")
 
     def stop_log(self) -> None:
-        if self.log_file:
-            self.log_file.close()
-            self.log_label.setText(f"stopped: {self.logged} rows in {self.log_file.name}")
-        self.log_file = self.log_writer = None
+        f = self.model.log_file
+        self.model.stop_log()
+        if f:
+            self.log_label.setText(f"stopped: {self.model.logged} rows in {f.name}")
 
     def _toggle_log(self, on: bool) -> None:
         if on:

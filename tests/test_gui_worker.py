@@ -23,6 +23,7 @@ if HAVE_QT:                  # an openscope_gui import error must fail, not skip
     from PySide6 import QtCore
     import numpy as np
     from openscope_gui.worker import ScopeFrame, Worker, link_lost  # noqa: E402
+    from openscope_gui import worker as worker_mod  # noqa: E402
 
 
 def status(mode=0, flags=proto.FLAG_CAPTURE_READY):
@@ -211,7 +212,7 @@ class TestWorker(unittest.TestCase):
         for _ in range(4):
             w.step()
         self.assertEqual([m.reading.update_count for m in self.ev["meter"]], [1, 2])
-        self.assertEqual(self.ev["note"], ["NOT_READY"])
+        self.assertEqual(self.ev["note"], [worker_mod.METER_BLANK_NOTE])     # stage-260: blank-meter note
         self.assertNotIn(("waveform", 1), dev.calls)       # no scope polls in meter mode
 
     def test_other_modes_poll_status_and_state_only(self):
@@ -690,6 +691,131 @@ class TestWorkerStage180(unittest.TestCase):
         self.assertFalse(dev.cancel())
         w.stop()
         self.assertTrue(dev.cancel())
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6/numpy not installed (pip install -e .[gui])")
+class TestWorkerStage260(unittest.TestCase):
+    """Mode table, read-back kinds, capability flags, typed events, blank meter."""
+    setUpClass = TestWorker.setUpClass
+    states = TestWorker.states
+
+    def make(self, opener, **kw):
+        w = TestWorker.make(self, opener, **kw)
+        self.events = []
+        w.event.connect(lambda e: self.events.append(e))
+        return w
+
+    def kinds(self, *only):
+        return [e.kind for e in self.events if not only or e.kind in only]
+
+    def test_one_poller_entry_per_mode(self):
+        self.assertEqual(set(worker_mod.POLLERS), {0, 1, 2})
+        self.assertEqual((worker_mod.MODE_SCOPE, worker_mod.MODE_METER, worker_mod.MODE_SIGGEN),
+                         (0, 1, 2))
+        for mode, name in worker_mod.POLLERS.items():
+            self.assertTrue(callable(getattr(Worker, name)), mode)
+
+    def test_generator_mode_makes_no_meter_or_waveform_request(self):
+        dev = FakeDevice(mode=2)
+        w = self.make(Opener(dev))
+        for _ in range(50):
+            w.step()
+        self.assertEqual(dev.calls.count("meter"), 0)
+        self.assertEqual(sum(1 for c in dev.calls if c[0] == "waveform"), 0)
+        self.assertEqual(dev.calls.count("status"), 50)     # status_s = 0: STATUS each step
+        self.assertEqual(self.states(), ["connected"])
+
+    def test_every_setter_has_a_method_and_a_known_read_back(self):
+        for what, (method, kind) in worker_mod.SETTERS.items():
+            self.assertIn(kind, worker_mod.READBACKS, what)
+            self.assertTrue(method.startswith(("set_", "run_")), what)
+
+    def test_a_set_runs_only_its_own_read_back(self):
+        dev = FakeDevice()
+        dev.set_meter_thing = lambda *a: dev.calls.append(("set_meter_thing",) + a)
+        dev.set_plain = lambda *a: dev.calls.append(("set_plain",) + a)
+        added = {"meter_thing": ("set_meter_thing", "meter"), "plain": ("set_plain", "none"),
+                 "gen_thing": ("set_plain", "siggen")}
+        worker_mod.SETTERS.update(added)
+        try:
+            w = self.make(Opener(dev), status_s=10.0)
+            w.step()
+            for what, readback in (("meter_thing", ["meter"]), ("plain", []), ("gen_thing", []),
+                                   ("timebase", ["scope_state"])):
+                start = len(dev.calls)
+                w.set(what, 1)
+                w.step()
+                calls = dev.calls[start:]
+                # the set, its read-back, then the scope mode poll (one waveform)
+                self.assertEqual([c for c in calls[1:] if not (isinstance(c, tuple) and c[0] == "waveform")],
+                                 readback, what)
+        finally:
+            for k in added:
+                del worker_mod.SETTERS[k]
+
+    def test_capability_flags_are_not_asked_after_a_reconnect(self):
+        dev1 = FakeDevice(mode=1)
+        dev1.state_error = Nak(proto.CMD_GET_SCOPE_STATE, 0x01)
+        dev2 = FakeDevice(mode=3)
+        w = self.make(Opener(dev1, dev2))
+        self.assertEqual(w.caps, {"scope": None, "meter": None, "siggen": None})
+        w.step()
+        self.assertEqual(w.caps, {"scope": False, "meter": True, "siggen": None})
+        self.assertFalse(w.has_state)
+        dev1.statuses = [DeviceError("port lost")]
+        w.step()                                            # loss
+        self.assertEqual(self.states(), ["connected", "disconnected"])
+        w._opener = Opener(dev2)
+        w.step()                                            # new connect, then STATUS + SCOPE_STATE
+        self.assertEqual(dev2.calls, ["status", "scope_state"])     # asked again: the flag was reset
+        self.assertEqual(w.caps, {"scope": True, "meter": None, "siggen": None})
+        self.assertTrue(w.has_state)
+        with self.assertRaises(AttributeError):
+            w.has_state = False                             # read-only alias
+
+    def test_blank_meter_period_is_one_event_one_note_no_drop(self):
+        nr = Nak(proto.CMD_GET_METER, 0x07)
+        dev = FakeDevice(mode=1, meters=[reading(1), nr, nr, nr, nr, reading(2), reading(2),
+                                         nr, reading(3)])
+        w = self.make(Opener(dev))
+        for _ in range(9):
+            w.step()
+        self.assertEqual(self.kinds("meter_blank", "meter_ok"),
+                         ["meter_blank", "meter_ok", "meter_blank", "meter_ok"])
+        self.assertEqual(self.ev["note"], [worker_mod.METER_BLANK_NOTE] * 2)  # one per blank period
+        self.assertEqual([m.reading.update_count for m in self.ev["meter"]], [1, 2, 3])
+        self.assertEqual(self.states(), ["connected"])
+        self.assertFalse(dev.closed)
+        self.assertNotIn("nak", self.kinds())               # a blank meter is not a NAK event
+
+    def test_other_meter_naks_stay_naks(self):
+        dev = FakeDevice(mode=1, meters=[Nak(proto.CMD_GET_METER, 0x09), reading(1)])
+        w = self.make(Opener(dev))
+        w.step()
+        w.step()
+        self.assertEqual(self.kinds("nak", "meter_blank"), ["nak"])
+        self.assertEqual(self.events[0].data["request"], "GET_METER")
+
+    def test_typed_events_next_to_the_text_signals(self):
+        no_data = Nak(proto.CMD_GET_WAVEFORM, 0x0B)
+        dev = FakeDevice(waves=[no_data, Timeout("no reply"), proto.ProtocolError("bad crc"),
+                                [wave(1)]])
+        w = self.make(Opener(dev))
+        for _ in range(4):
+            w.step()
+        w.set("run", False)
+        w.step()
+        nak = next(e for e in self.events if e.kind == "nak")
+        self.assertEqual((nak.ok, nak.text, nak.data),
+                         (False, "NO_CAPTURE_DATA", {"error": "NO_CAPTURE_DATA", "request": "GET_WAVEFORM"}))
+        self.assertEqual(self.kinds("nak", "timeout", "protocol"), ["nak", "timeout", "protocol"])
+        job = next(e for e in self.events if e.kind == "job")
+        self.assertEqual((job.ok, job.text, job.data), (True, "run False", {"job": "set"}))
+        self.assertEqual(self.ev["job"], [("set", True, "run False")])     # job_done still comes
+        self.assertEqual(len(self.ev["note"]), 3)                          # note still comes
+        with self.assertRaises(Exception):
+            nak.kind = "x"                                                 # frozen
+        self.assertTrue(set(self.kinds()) <= set(worker_mod.EVENT_KINDS))
 
 
 if __name__ == "__main__":

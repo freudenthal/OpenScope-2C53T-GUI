@@ -49,6 +49,16 @@ iapdrive.list_drives); it never opens a file on a drive. Offline (the update
 wizard sets it) the worker sends nothing and polls nothing; `offline_done` is
 set once the device is closed and the port is free. `backup()` runs
 calbackup.make_backup() on the worker's Device.
+
+Stage-260: one structure for every unit mode. `POLLERS` maps each mode to its
+poller (the generator entry sends nothing until stage-285). `SETTERS` maps
+each setting to (Device method, read-back kind), and a set runs only the
+read-back of its kind (`READBACKS`). `caps` holds one capability flag per
+kind, None ("not asked") after each connect; `has_state` is the read-only
+scope flag. The `event` signal carries a typed `Event` (nak, meter_blank,
+meter_ok, job, protocol, timeout) next to the text signals. A blank meter
+(NAK NOT_READY) is one `meter_blank` event and one note per blank period, then
+one `meter_ok`; it never drops the link (review Q-7).
 """
 from __future__ import annotations
 
@@ -56,7 +66,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 from PySide6 import QtCore
@@ -67,11 +77,22 @@ from openscope.link import NoDevice
 
 from .labels import Compat
 
-MODE_SCOPE, MODE_METER = 0, 1
+MODE_SCOPE, MODE_METER, MODE_SIGGEN = 0, 1, 2
 
-# set(what, *args) -> Device method (stage-085, the 080 control surface)
-SETTERS = {"mode": "set_mode", "timebase": "set_timebase", "vdiv": "set_vdiv",
-           "trigger": "set_trigger", "run": "run_stop", "probe": "set_probe"}
+# Stage-260: one table entry per unit mode -> the Worker method that polls it.
+# The generator entry sends nothing until stage-285 adds GET_SIGGEN.
+POLLERS = {MODE_SCOPE: "_poll_scope", MODE_METER: "_poll_meter", MODE_SIGGEN: "_poll_siggen"}
+# Read-back kind -> the Worker method that reads the state in force after a set.
+READBACKS = {"scope": "_poll_state", "meter": "_read_meter", "siggen": "_read_siggen", "none": None}
+# Capability flags, one per read-back kind: None = not asked on this connection.
+CAPS = ("scope", "meter", "siggen")
+# set(what, *args) -> (Device method, read-back kind) (stage-085 control surface;
+# stage-260 read-back kinds). A set runs only its own read-back.
+SETTERS = {"mode": ("set_mode", "scope"), "timebase": ("set_timebase", "scope"),
+           "vdiv": ("set_vdiv", "scope"), "trigger": ("set_trigger", "scope"),
+           "run": ("run_stop", "scope"), "probe": ("set_probe", "scope")}
+NOT_READY = 0x07
+METER_BLANK_NOTE = "meter blank: NOT_READY"
 # I-40: never sent to the unit, whatever the user types in the debug console.
 FORBIDDEN_SHELL = ("cal restore", "mem write")
 
@@ -129,6 +150,29 @@ class MeterSample:
     reading: proto.MeterReading
 
 
+EVENT_KINDS = ("nak", "meter_blank", "meter_ok", "job", "protocol", "timeout")
+
+
+@dataclass(frozen=True)
+class Event:
+    """A typed worker event (stage-260). `kind` is one of EVENT_KINDS; `data`
+    holds the fields: nak {"error", "request"}, job {"job"}, meter_* {"t_unix"}.
+    The text signals (`note`, `job_done`) still come for the status bar, the
+    --events log and the bench scripts."""
+    kind: str
+    ok: bool
+    text: str = ""
+    data: Any = None
+
+
+def cmd_name(cmd: int) -> str:
+    """The protocol request name of a command byte (GET_METER, SET_TIMEBASE, ...)."""
+    for k, v in vars(proto).items():
+        if k.startswith("CMD_") and v == cmd:
+            return k[4:]
+    return f"0x{cmd:02X}"
+
+
 class Worker(QtCore.QThread):
     connection = QtCore.Signal(str, str)    # state ("searching"/"connected"/"disconnected"), detail
     status = QtCore.Signal(object)          # proto.Status
@@ -144,6 +188,7 @@ class Worker(QtCore.QThread):
     compat = QtCore.Signal(object)          # labels.Compat (stage-210), on each change
     backup_progress = QtCore.Signal(str, int, int)   # part ("cal"), done, total
     backup_result = QtCore.Signal(object)   # dict: folder, uid, crc32s, verified, problems; or error
+    event = QtCore.Signal(object)           # Event (stage-260): typed nak/meter/job/protocol/timeout
 
     MAX_TIMEOUTS = 3        # consecutive request timeouts before the link counts as lost
 
@@ -170,7 +215,8 @@ class Worker(QtCore.QThread):
         self._last_key: Optional[Tuple[int, int]] = None    # (frame_id, mask used): worker thread only
         self._last_uc: Optional[int] = None
         self._timeouts = 0
-        self.has_state: Optional[bool] = None   # None = not asked yet on this connection
+        self.caps = {k: None for k in CAPS}     # per read-back kind; None = not asked on this connection
+        self._meter_blank = False           # in a blank meter period (NOT_READY), worker thread only
         self._need_desc = False
         self.port: Optional[str] = None     # None = automatic (VID:PID); read by the opener
         self.online = True                  # False = stay disconnected (Device > Disconnect)
@@ -295,7 +341,8 @@ class Worker(QtCore.QThread):
             self._probed = False
             self.stats["connects"] += 1
             self._last_status, self._last_key, self._last_uc, self._timeouts = -1e9, None, None, 0
-            self.has_state = None
+            self.caps = {k: None for k in CAPS}
+            self._meter_blank = False
             self._need_desc = True
             self._set_state("connected", getattr(self.dev.link, "port", "") or "")
         try:
@@ -313,31 +360,37 @@ class Worker(QtCore.QThread):
                     self._emit_compat(Compat("binary", self._compat_api[0], st.fw_version))
                     self._compat_api = None
                 self._poll_state()
-            if self.paused:
+            poller = None if self.paused else POLLERS.get(self.mode)
+            if poller is None:              # paused, Settings mode, or no STATUS yet
                 self._pause(self.idle_s)
-            elif self.mode == MODE_SCOPE:
-                self._poll_scope()
-            elif self.mode == MODE_METER:
-                self._poll_meter()
             else:
-                self._pause(self.idle_s)
+                getattr(self, poller)()
             self._timeouts = 0
         except Nak as e:
             self._timeouts = 0
             self.stats["naks"] += 1
-            self.note.emit(proto.ERRORS.get(e.code, hex(e.code)))
+            name = proto.ERRORS.get(e.code, hex(e.code))
+            self.note.emit(name)
+            self.event.emit(Event("nak", False, name, {"error": name, "request": cmd_name(e.cmd)}))
             self._pause(self.nak_s)
         except Timeout as e:
             self._timeouts += 1
+            self.event.emit(Event("timeout", False, str(e), {"count": self._timeouts}))
             if self._timeouts >= self.MAX_TIMEOUTS:
                 self._drop(f"{self._timeouts} timeouts in a row: {e}")
             else:
                 self.note.emit(f"timeout: {e}")
         except proto.ProtocolError as e:
             self.note.emit(f"protocol: {e}")
+            self.event.emit(Event("protocol", False, str(e)))
             self._pause(self.nak_s)
         except Exception as e:              # DeviceError, NoDevice (port lost), OSError, a job's link loss
             self._drop(f"{type(e).__name__}: {e}")
+
+    def _done(self, job: str, ok: bool, msg: str) -> None:
+        """A finished job: the text signal and the typed event."""
+        self.job_done.emit(job, ok, msg)
+        self.event.emit(Event("job", ok, msg, {"job": job}))
 
     def _emit_compat(self, c: Compat) -> None:
         if c != self._compat:
@@ -401,29 +454,62 @@ class Worker(QtCore.QThread):
         ident = getattr(d, "identity", None)
         self._compat_api = (ident.api_level if ident is not None else None,)
 
+    @property
+    def has_state(self) -> Optional[bool]:
+        """The scope capability flag (read-only alias of caps["scope"])."""
+        return self.caps["scope"]
+
     def _poll_state(self) -> None:
         """SCOPE_STATE, unless this firmware has shown it has none."""
-        if self.has_state is False:
+        if self.caps["scope"] is False:
             return
         try:
             s = self.dev.scope_state()
         except Nak as e:
-            if self.has_state is None:          # older image: no control surface
-                self.has_state = False
+            if self.caps["scope"] is None:      # older image: no control surface
+                self.caps["scope"] = False
                 self.note.emit(f"no scope controls on this firmware "
                                f"(GET_SCOPE_STATE: {proto.ERRORS.get(e.code, hex(e.code))})")
                 return
             raise
-        self.has_state = True
+        self.caps["scope"] = True
         self.scope_state.emit(s)
 
     def _poll_meter(self) -> None:
-        m = self.dev.meter()
+        """One GET_METER, then a pause of meter_s. A blank meter (NAK NOT_READY,
+        G-220) is a period, not an error: one `meter_blank` event and one note
+        when it starts, one `meter_ok` when a reading comes back (review Q-7)."""
+        self._read_meter()
+        self._pause(self.meter_s)
+
+    def _read_meter(self) -> None:
+        try:
+            m = self.dev.meter()
+        except Nak as e:
+            if e.code != NOT_READY:
+                raise
+            self.stats["naks"] += 1
+            if not self._meter_blank:
+                self._meter_blank = True
+                self.note.emit(METER_BLANK_NOTE)
+                self.event.emit(Event("meter_blank", False, "NOT_READY", {"t_unix": time.time()}))
+            return
+        self.caps["meter"] = True
+        if self._meter_blank:
+            self._meter_blank = False
+            self.event.emit(Event("meter_ok", True, "", {"t_unix": time.time()}))
         if m.update_count != self._last_uc:
             self._last_uc = m.update_count
             self.stats["meter"] += 1
             self.meter.emit(MeterSample(time.time(), m))
-        self._pause(self.meter_s)
+
+    def _poll_siggen(self) -> None:
+        """Generator mode: no request until stage-285 (GET_SIGGEN); STATUS and
+        SCOPE_STATE still come every status_s."""
+        self._pause(self.idle_s)
+
+    def _read_siggen(self) -> None:
+        """Read-back of a generator set: none until stage-285."""
 
     def _run_jobs(self) -> None:
         while True:
@@ -439,22 +525,24 @@ class Worker(QtCore.QThread):
             try:
                 if job == "press":
                     self.dev.press(arg)
-                    self.job_done.emit(job, True, proto_button_name(arg))
+                    self._done(job, True, proto_button_name(arg))
                     self._last_status = -1e9        # a press may change the mode: poll now
                 elif job == "screenshot":
                     self._screenshot_job(*arg)
                 elif job == "set":
                     what, args = arg
+                    method, readback = SETTERS[what]
                     try:
-                        getattr(self.dev, SETTERS[what])(*args)
+                        getattr(self.dev, method)(*args)
                     except Exception:
                         self.set_done.emit(what, False)
                         raise
-                    self.job_done.emit(job, True, f"{what} {' '.join(str(a) for a in args)}".strip())
+                    self._done(job, True, f"{what} {' '.join(str(a) for a in args)}".strip())
                     self.set_done.emit(what, True)
                     if what == "mode":
                         self._last_status = -1e9    # STATUS knows the mode first: poll now
-                    self._poll_state()
+                    if READBACKS[readback] is not None:
+                        getattr(self, READBACKS[readback])()
                 elif job == "info":
                     self._info_job()
                 elif job == "backup":
@@ -466,17 +554,17 @@ class Worker(QtCore.QThread):
                         self.shell_out.emit(arg, f"error: {e}")
                         raise
                     self.shell_out.emit(arg, out)
-                    self.job_done.emit(job, True, arg)
+                    self._done(job, True, arg)
             except Nak as e:
                 name = proto.ERRORS.get(e.code, hex(e.code))
                 what = f"{arg[0]} " if job == "set" else ""
-                self.job_done.emit(job, False, f"{what}refused: {name}: {proto.NAK_HINTS.get(name, '')}".rstrip(": "))
+                self._done(job, False, f"{what}refused: {name}: {proto.NAK_HINTS.get(name, '')}".rstrip(": "))
             except Exception as e:
                 # Every job reports (review Q-5: a non-ASCII shell line raised
                 # UnicodeEncodeError and the job never ended). A link loss then
                 # goes on to step(), which drops the device; any other error
                 # leaves the link up and the next STATUS poll decides.
-                self.job_done.emit(job, False, f"{type(e).__name__}: {e}")
+                self._done(job, False, f"{type(e).__name__}: {e}")
                 if link_lost(e):
                     raise
 
@@ -492,7 +580,7 @@ class Worker(QtCore.QThread):
             pass
         self.info.emit({"version": version, "port": getattr(self.dev.link, "port", "") or "",
                         "status": st, "state": state, "description": desc})
-        self.job_done.emit("info", True, "")
+        self._done("info", True, "")
 
     def _backup_job(self, root) -> None:
         from openscope import calbackup as cb
@@ -510,7 +598,7 @@ class Worker(QtCore.QThread):
                                  "cal_crc32": info["files"][cb.CAL_FILE]["crc32"],
                                  "block_crc32": info["cal"]["block_crc32"],
                                  "verified": v.ok, "problems": list(v.problems)})
-        self.job_done.emit("backup", v.ok, "" if v.ok else "; ".join(v.problems))
+        self._done("backup", v.ok, "" if v.ok else "; ".join(v.problems))
 
     def _screenshot_job(self, path: str, hold: bool) -> None:
         from openscope.screen import save_png
@@ -529,7 +617,7 @@ class Worker(QtCore.QThread):
         save_png(path, s.w, s.h, s.indexed4, scale=2)
         crc = "transport CRC ok, screen changed during capture" if s.torn else "CRC ok"
         how = ", held" if held else ""
-        self.job_done.emit("screenshot", True, f"{path} ({s.w}x{s.h}, {crc}{how})")
+        self._done("screenshot", True, f"{path} ({s.w}x{s.h}, {crc}{how})")
 
     def _fail_queued_jobs(self, why: str) -> None:
         while True:
@@ -545,7 +633,7 @@ class Worker(QtCore.QThread):
                 self.shell_out.emit(arg, f"error: {why}")
             if job == "backup":
                 self.backup_result.emit({"error": why})
-            self.job_done.emit(job, False, why)
+            self._done(job, False, why)
 
 
 def proto_button_name(bid: int) -> str:

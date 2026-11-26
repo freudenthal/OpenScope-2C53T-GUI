@@ -17,21 +17,28 @@ wizard in update_wizard.py). A banner over the tabs tells the user when the
 firmware needs an update (labels.compat_text of the worker's compat report),
 with one button that opens the wizard. The unit ID and the git revision show
 only in dialogs, never in the main window.
+
+Stage-260: `self.panels` holds one panels.Panel per tab (mode id -> panel);
+`self.panel` is the scope panel. A disconnect clears every panel and the
+meter. The worker's typed events (worker.Event) come to `_worker_event`: a
+blank meter period greys the meter value and logs one --events line at its
+start and one at its end.
 """
 from __future__ import annotations
 
 import csv
 import os
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from openscope import proto
 from . import dialogs, labels, update_wizard
+from .panels import Panel, PlaceholderPanel
 from .scope_panel import ScopePanel, continuous
 from .views import MeterView, Rate, ScopeView
-from .worker import ScopeFrame, Worker, port_busy
+from .worker import Event, ScopeFrame, Worker, port_busy
 
 DRAW_HZ = 30
 KEYS = [["CH1", "CH2", "MOVE", "SELECT", "TRIGGER"],
@@ -44,8 +51,8 @@ SINGLE_TIP = "Capture one triggered record, then hold it"
 MODE_TIMEOUT_MS = 8000                            # longest SET_MODE (5 s) + margin
 SETTINGS_BANNER = "The unit shows its settings menu"
 PORT_BUSY_TEXT = "Port in use by another program"   # status bar, stage-180 (Q-10)
-PLACEHOLDER = {1: "Multimeter function controls come in stage 088.",
-               2: "Signal generator controls come in stage 089."}
+PLACEHOLDER = {1: "Multimeter function controls come in stage 275.",
+               2: "Signal generator controls come in stage 285."}
 VIEW_DEFAULTS = {"view/control_panel": True, "view/unit_keys": False,
                  "view/uncalibrated": False, "view/advanced": False}
 
@@ -122,10 +129,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.channels_changed.connect(self.worker.set_channels)
         self.panel.level_50.connect(self._level_50)
         self.scope.level_dragged.connect(self.panel.set_level_counts)
+        self.panels: Dict[int, Panel] = {0: self.panel, 1: PlaceholderPanel(1, PLACEHOLDER[1]),
+                                         2: PlaceholderPanel(2, PLACEHOLDER[2])}
         self.stack = QtWidgets.QStackedWidget()
-        self.stack.addWidget(self.panel)
-        self.stack.addWidget(_placeholder(PLACEHOLDER[1]))
-        self.stack.addWidget(_placeholder(PLACEHOLDER[2]))
+        for mode in TAB_MODES:                  # stack index == tab index == mode id
+            self.stack.addWidget(self.panels[mode])
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.stack)
@@ -179,6 +187,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.set_done.connect(self._set_done)
         worker.info.connect(self._info)
         worker.compat.connect(self._compat)
+        worker.event.connect(self._worker_event)
         self.meter.log_btn.toggled.connect(self._meter_log_toggled)
         self.timer = QtCore.QTimer(self)
         self.timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -383,9 +392,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.banner.hide()
             if state == "offline":
                 self.compat_banner.hide()
-            self.panel.clear()
+            for p in self.panels.values():
+                p.clear()
+                p.set_description(None)
             self.scope.clear()                  # no old trace after a reconnect (review Q-10)
-            self.panel.set_description(None)
+            self.meter.clear()                  # no old reading either (review Q-7)
             self._actions_enabled(False)
             if state == "disconnected":
                 self.sb_note.setText(labels.note_words(detail)[:120])
@@ -408,7 +419,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _description(self, d: Optional[proto.Description]) -> None:
         self.desc = d
-        self.panel.set_description(d)
+        for p in self.panels.values():
+            p.set_description(d)
         self._update_scope_status()
 
     def _scope_state(self, s: proto.ScopeState) -> None:
@@ -450,6 +462,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._event(f"note {text}")
         self.sb_note.setText(f"{time.strftime('%H:%M:%S')} {labels.note_words(text)}")
         self.sb_note.setToolTip(text)
+
+    def _worker_event(self, e: Event) -> None:
+        """Typed worker events. The text of notes and jobs still comes by
+        `note` and `job_done` (status bar, --events)."""
+        if e.kind in ("meter_blank", "meter_ok"):
+            self.meter.set_blank(e.kind == "meter_blank")
+            self._event(f"event {e.kind} {e.text}".rstrip())
 
     def _job_done(self, job: str, ok: bool, msg: str) -> None:
         self._event(f"job {job} {'ok' if ok else 'FAILED'} {msg}")

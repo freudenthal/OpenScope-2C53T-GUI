@@ -12,6 +12,10 @@ Single is a trigger mode on the unit: after Single the unit reports
 button counts trigger Single as not running: it shows "Run", and Run puts
 back the trigger mode in force before Single (Auto if none was seen) and
 runs. Without that, Run/Stop only re-armed another single capture.
+
+Stage-260: ScopePanel is a panels.Panel; the level box sends through a
+panels.EditSender (one set per finished edit) and shows the reported level
+only while it has no focus (the Q-1 rule, now in panels.py).
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from PySide6 import QtCore, QtWidgets
 
 from openscope import proto
 from . import labels
+from .panels import EditSender, Panel, show_reported, write_value
 
 TIP = QtCore.Qt.ToolTipRole
 SINGLE = 2                                      # proto.TRIG_MODES[2]
@@ -50,7 +55,8 @@ def fill_combo(cb: QtWidgets.QComboBox, items: List[labels.Item], current: Optio
     cb.setToolTip(cb.itemData(i, TIP) if i >= 0 else "")
 
 
-class ScopePanel(QtWidgets.QWidget):
+class ScopePanel(Panel):
+    mode = 0
     channels_changed = QtCore.Signal(int)       # display mask (bit0 CH1, bit1 CH2)
     level_50 = QtCore.Signal()                  # "Level to 50 %": the window knows the record
 
@@ -123,7 +129,8 @@ class ScopePanel(QtWidgets.QWidget):
             cb.activated.connect(self._send_trigger)
         self.level_sb = QtWidgets.QDoubleSpinBox()
         self.level_sb.setKeyboardTracking(False)
-        self.level_sb.editingFinished.connect(self._level_done)
+        self.level_edit = EditSender(self.level_sb, self._send_level, value=self._typed_level,
+                                     finished=self._level_finished)
         self._apply_level_scale()
         f.addRow("Trigger", self.tmode_cb)
         row = QtWidgets.QHBoxLayout()
@@ -202,8 +209,8 @@ class ScopePanel(QtWidgets.QWidget):
         fill_combo(self.tedge_cb, labels.word_items(labels.TRIG_EDGE_WORDS, "Trigger edge"), s.trig_edge)
         fill_combo(self.tsrc_cb, labels.source_items(), s.trig_source)
         self._lscale = labels.level_scale(d, s)
-        if not self.level_sb.hasFocus():        # never overwrite a level being typed
-            self._show_level(s.trig_level)
+        self.level_edit.reported(s.trig_level)
+        self._show_level(s.trig_level)          # not while a level is being typed
         self.level_sb.setToolTip(labels.level_tooltip(s))
         self.state_lbl.setText("\n".join(labels.state_lines(s, d)))
 
@@ -246,9 +253,10 @@ class ScopePanel(QtWidgets.QWidget):
         lv = labels.level_for_counts(self.desc, counts)
         if lv is None or self.st is None:
             return
-        self._show_level(lv)
+        self._show_level(lv, force=True)
         if lv != self.st.trig_level:
             self._send_trigger(level=lv)
+            self.level_edit.last = lv           # a focus out of the box does not send it again
 
     def level(self) -> int:
         """The level for the box's value. A value the user did not edit is the level
@@ -266,22 +274,27 @@ class ScopePanel(QtWidgets.QWidget):
                         proto.TRIG_SOURCES[self.tsrc_cb.currentData()],
                         self.level() if level is None else level)
 
-    def _level_done(self) -> None:
-        """Enter or focus out: send the typed level, then show it on the scale in force."""
-        if self.st is None:
-            return
-        lv = self.level()
-        if lv != self.st.trig_level:
-            self._send_trigger(level=lv)
-        self._show_level(lv)
+    def _typed_level(self) -> Optional[int]:
+        """The level the box asks for (None: no state yet, nothing to send)."""
+        return None if self.st is None else self.level()
 
-    def _show_level(self, lv: int) -> None:
-        """Put the scale in force and level `lv` in the box. Sends nothing."""
-        self._apply_level_scale()
+    def _send_level(self, lv: int) -> None:
+        """EditSender: Enter or focus out with a new level."""
+        self._send_trigger(level=lv)
+
+    def _level_finished(self, lv: Optional[int]) -> None:
+        """After every finished edit: show the level on the scale in force."""
+        if lv is not None:
+            self._show_level(lv, force=True)
+
+    def _show_level(self, lv: int, force: bool = False) -> None:
+        """Put the scale in force and level `lv` in the box. Sends nothing.
+        Only when the box has no focus, unless `force` (the user's own edit)."""
         sb = self.level_sb
-        sb.blockSignals(True)
-        sb.setValue(self._lscale.value(lv))
-        sb.blockSignals(False)
+        if sb.hasFocus() and not force:
+            return
+        self._apply_level_scale()
+        (write_value if force else show_reported)(sb, self._lscale.value(lv))
         self._shown_level, self._shown_value = lv, sb.value()
 
     def _apply_level_scale(self) -> None:

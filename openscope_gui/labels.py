@@ -531,6 +531,7 @@ NOTE_WORDS = {
     "UNSUPPORTED_IN_MODE": "Not available in this unit mode",
     "BAD_ARG": "The unit refused a value",
     "UNSUPPORTED": "This firmware does not do that",
+    "meter blank": "The meter has no reading yet; waiting",     # worker.METER_BLANK_NOTE (stage-260)
 }
 # stage-230: a scope set outside scope mode (NAK UNSUPPORTED_IN_MODE)
 SCOPE_MODE_NEEDED = "scope settings need scope mode"
