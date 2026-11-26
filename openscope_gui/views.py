@@ -29,7 +29,11 @@ def fft_peak(x: np.ndarray, fs: Optional[float]):
     """Spectrum of one record body and its strongest non-DC peak.
     Returns (freqs, mag_db, peak_freq). Hann window, zero-padded to FFT_PAD,
     parabolic interpolation on the log magnitude around the peak bin.
-    Frequencies in Hz when fs is known, else in cycles/sample."""
+    Frequencies in Hz when fs is known, else in cycles/sample.
+    peak_freq is None when the strongest bin above the low cut is not the
+    maximum of its own main lobe (a ramp or a slow drift: the spectrum only
+    falls from DC; one edge of a slow square), and the interpolation step stays
+    within half a bin (Q-9)."""
     x = np.asarray(x, float)
     n = len(x)
     if n < 16 or np.ptp(x) < MIN_SPAN:
@@ -41,30 +45,49 @@ def fft_peak(x: np.ndarray, fs: Optional[float]):
     db = 20 * np.log10(spec / spec.max() + 1e-12)
     lo = int(np.ceil(2 * FFT_PAD / n))          # skip DC and the window's main lobe around it
     k = lo + int(np.argmax(spec[lo:]))
-    if 0 < k < len(spec) - 1:
-        a, b, c = np.log(spec[k - 1:k + 2] + 1e-12)
-        d = 0.5 * (a - c) / (a - 2 * b + c) if (a - 2 * b + c) else 0.0
-    else:
-        d = 0.0
+    # a tone is the maximum of its own Hann main lobe (+-2 natural bins = +-lo padded
+    # bins); a ramp, or a sidelobe of the leakage of one edge (a record shorter than a
+    # period, stage-255 bench: "35 Hz" for 10 Hz at 0x10), is not
+    if not (0 < k < len(spec) - 1 and spec[k] >= spec[max(0, k - lo):k + lo + 1].max()):
+        return freqs, db, None
+    a, b, c = np.log(spec[k - 1:k + 2] + 1e-12)
+    den = a - 2 * b + c
+    d = float(np.clip(0.5 * (a - c) / den, -0.5, 0.5)) if den else 0.0
     return freqs, db, (k + d) * unit / FFT_PAD
 
 
-def median_period(x: np.ndarray) -> Optional[float]:
-    """Mean of the single periods (rising midpoint crossings, sub-sample)
-    within 10 % of their median: a seam that cuts a period cannot bias it
-    (G-240; same method as openscope-bench/capture_stats.py). In samples."""
+def rising_crossings(x: np.ndarray) -> np.ndarray:
+    """Sub-sample positions of the rising crossings of the 5-95 % midpoint,
+    with hysteresis of a quarter of that span (proto.estimate_period's rule):
+    the signal must fall below mid - span/4 before the next crossing counts, so
+    noise near the level cannot add crossings (Q-9). Empty when flat."""
     x = np.asarray(x, float)
     if len(x) < 8:
-        return None
+        return np.empty(0)
     lo, hi = np.percentile(x, 5), np.percentile(x, 95)
     if hi - lo < MIN_SPAN:
-        return None
+        return np.empty(0)
     mid = (lo + hi) / 2
-    b = x > mid
-    r = np.nonzero(~b[:-1] & b[1:])[0]
-    if len(r) < 3:
+    low = mid - (hi - lo) / 4
+    out = []
+    armed = False
+    for i in range(1, len(x)):
+        a, b = x[i - 1], x[i]
+        if b <= low:
+            armed = True
+        if armed and a < mid <= b:
+            out.append(i - 1 + (mid - a) / (b - a))
+            armed = False
+    return np.array(out)
+
+
+def median_period(x: np.ndarray) -> Optional[float]:
+    """Mean of the single periods (rising crossings with hysteresis, sub-sample)
+    within 10 % of their median: a seam that cuts a period cannot bias it
+    (G-240; same method as openscope-bench/capture_stats.py). In samples."""
+    rr = rising_crossings(x)
+    if len(rr) < 3:
         return None
-    rr = r + (mid - x[r]) / (x[r + 1] - x[r])
     iv = np.diff(rr)
     med = np.median(iv)
     good = iv[np.abs(iv - med) < 0.1 * med]
@@ -223,7 +246,8 @@ class ScopeView(QtWidgets.QWidget):
             self.plot.setXRange(0, n * scale, padding=0)
         x = np.arange(n) * scale
         self.head.setRegion((0, f.head_skip * scale))
-        if f.waves and f.waves[0].time_ordered:     # hardware trigger at index 512
+        ordered = bool(f.waves and f.waves[0].time_ordered)
+        if ordered:                                 # hardware trigger at index 512
             self.trig_mark.setValue(512 * scale)
             self.trig_mark.show()
         else:
@@ -250,6 +274,8 @@ class ScopeView(QtWidgets.QWidget):
                 txt += f"  FFT peak {fmt_hz(pk) if fs else f'{pk:.5f} cyc/sample'}"
             if per:
                 txt += f"  period {per:.3f} samples" + (f" = {fmt_hz(fper)}" if fper else "")
+                if not ordered:     # the record may hold a seam: the median filter drops cut periods
+                    txt += " (seam-filtered)"
             meas.append(txt)
         for ch in (0, 1):
             if ch not in shown:

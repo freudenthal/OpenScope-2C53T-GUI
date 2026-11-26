@@ -37,9 +37,10 @@ def square(f_hz, n=1024, fs=FS, lo=12, hi=100, seam_at=None):
     return x
 
 
-def frame(samples, rate=FS, head_skip=128, channels=(0,)):
+def frame(samples, rate=FS, head_skip=128, channels=(0,), ordered=False):
     rows = np.atleast_2d(samples).astype(np.uint8)
-    waves = tuple(proto.Waveform(7, ch, proto.WAVE_FLAG_TB_MEASURED if rate else 0, 0x10, 5,
+    flags = (proto.WAVE_FLAG_TB_MEASURED if rate else 0) | (proto.WAVE_FLAG_TIME_ORDERED if ordered else 0)
+    waves = tuple(proto.Waveform(7, ch, flags, 0x10, 5,
                                  rows.shape[1], 24, rate, 0, 32, head_skip, rows[i].tobytes())
                   for i, ch in enumerate(channels))
     return ScopeFrame.from_waves(waves, 0.0)
@@ -73,6 +74,67 @@ class TestAnalysis(unittest.TestCase):
         b = x > 56
         r = np.nonzero(~b[:-1] & b[1:])[0]
         self.assertGreater(abs(FS / np.diff(r).mean() - 1000.0), 5.0)
+
+    # stage-255 (Q-9): small noisy sines, a ramp, a peak between bins
+    def noisy_sine(self, counts, period=37.3, n=896, seed=1):
+        rng = np.random.default_rng(seed)
+        i = np.arange(n)
+        x = 128 + counts / 2 * np.sin(2 * np.pi * i / period) + rng.integers(-1, 2, n)
+        return np.round(x).astype(np.uint8)
+
+    def test_median_period_on_small_noisy_sines(self):
+        for counts in (10, 20):
+            for seed in range(5):
+                x = self.noisy_sine(counts, seed=seed)
+                per = views.median_period(x)
+                self.assertIsNotNone(per, f"{counts} counts seed {seed}")
+                self.assertAlmostEqual(per / 37.3, 1.0, delta=0.01, msg=f"{counts} counts seed {seed}")
+        # negative control: without hysteresis (the stage-250 GUI) 1 LSB noise
+        # adds crossings and the median period of a 10-count sine is far off
+        x = self.noisy_sine(10).astype(float)
+        mid = (np.percentile(x, 5) + np.percentile(x, 95)) / 2
+        b = x > mid
+        r = np.nonzero(~b[:-1] & b[1:])[0]
+        self.assertLess(np.median(np.diff(r)), 0.9 * 37.3)
+
+    def test_ramp_has_no_fft_peak(self):
+        for x in (np.linspace(10, 200, 896), np.r_[np.full(448, 20.0), np.linspace(20, 200, 448)]):
+            freqs, db, pk = views.fft_peak(np.round(x).astype(np.uint8), FS)
+            self.assertIsNotNone(freqs)                 # the spectrum is still drawn
+            self.assertIsNone(pk)
+        # negative control: the stage-250 step at k = lo reported a "peak" 3 bins off
+        x = np.linspace(10, 200, 896)
+        spec = np.abs(np.fft.rfft((x - x.mean()) * np.hanning(896), views.FFT_PAD))
+        lo = int(np.ceil(2 * views.FFT_PAD / 896))
+        k = lo + int(np.argmax(spec[lo:]))
+        a, b, c = np.log(spec[k - 1:k + 2])
+        self.assertEqual(k, lo)
+        self.assertGreater(abs(0.5 * (a - c) / (a - 2 * b + c)), 0.5)
+
+    def test_one_edge_of_a_slow_square_has_no_fft_peak(self):
+        # stage-255 bench: 10 Hz on CH2 at 0x10 (12.5 kS/s) - the 896-sample body holds
+        # less than a period; the old rule showed a "35 Hz" peak (a leakage sidelobe)
+        hits = 0
+        for phase in np.linspace(0, 0.1, 21):
+            t = phase + np.arange(1024) / 12500
+            x = np.round(128 + 40 * np.tanh(3 * np.sin(2 * np.pi * 10 * t))).astype(np.uint8)[128:]
+            if np.ptp(x) < 4:
+                continue
+            hits += 1
+            self.assertIsNone(views.fft_peak(x, 12500)[2], f"phase {phase:.3f}")
+        self.assertGreater(hits, 10)
+        # a tone of 3 periods in the body, just above the low cut, is still found
+        f = 3 * 12500 / 896
+        x = np.round(128 + 60 * np.sin(2 * np.pi * f * np.arange(896) / 12500)).astype(np.uint8)
+        self.assertAlmostEqual(views.fft_peak(x, 12500)[2], f, delta=0.02 * f)
+
+    def test_fft_peak_between_bins_stays_within_half_a_bin(self):
+        binw = FS / views.FFT_PAD
+        for f in np.arange(400.0, 420.0, 0.37 * binw):
+            i = np.arange(896)
+            x = np.round(128 + 60 * np.sin(2 * np.pi * f * i / FS)).astype(np.uint8)
+            _, _, pk = views.fft_peak(x, FS)
+            self.assertLess(abs(pk - f), 0.5 * binw, f"{f:.3f} Hz")
 
     def test_rate_window(self):
         r = views.Rate(2.0)
@@ -144,6 +206,18 @@ class TestViews(unittest.TestCase):
         v.set_frame(frame(square(1000.0)))                    # back to CH1 only
         v.redraw()
         self.assertIsNone(v.curves[1].getData()[0])
+
+    def test_period_says_seam_filtered_unless_time_ordered(self):
+        v = views.ScopeView()
+        v.set_frame(frame(square(1000.0, seam_at=411)))
+        v.redraw()
+        self.assertIn("(seam-filtered)", v.meas.text())
+        self.assertAlmostEqual(v.peaks[0][1], 1000.0, delta=2.0)
+        self.assertFalse(v.trig_mark.isVisible())
+        v.set_frame(frame(square(1000.0), ordered=True))
+        v.redraw()
+        self.assertNotIn("seam-filtered", v.meas.text())
+        self.assertIn("period", v.meas.text())
 
     def test_meter_chart_and_csv_log(self):
         m = views.MeterView()

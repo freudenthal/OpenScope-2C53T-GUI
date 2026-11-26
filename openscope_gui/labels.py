@@ -114,9 +114,14 @@ def timebase_tooltip(desc: Optional[proto.Description], code: int) -> str:
 def timebase_items(desc: Optional[proto.Description], show_uncalibrated: bool = False,
                    current: Optional[int] = None) -> List[Item]:
     """Timebase list, fastest first. `current` is always listed (as "Not
-    calibrated" if it has no rate), so the combo can show what is in force."""
+    calibrated" if it has no rate), so the combo can show what is in force.
+    Codes with the same text (0x00-0x04 all sample at 125 MS/s, stage-250) give
+    one item: the lowest code, or `current` when it is one of them; the
+    tooltip names the other codes (stage-255). `show_uncalibrated` lists every
+    code, the duplicates too."""
     n = len(desc.rates) if desc and desc.rates else proto.TIMEBASE_CODES
-    out = []
+    out: List[Item] = []
+    same: dict = {}                     # text -> codes that give it
     for code in range(n):
         t = desc.time_per_div(code) if desc else None
         tier = desc.tier("timebase", code) if desc else "none"
@@ -128,8 +133,25 @@ def timebase_items(desc: Optional[proto.Description], show_uncalibrated: bool = 
             text = "Not calibrated"
         else:
             continue
-        out.append(Item(code, text, timebase_tooltip(desc, code), tier if t is not None else "none"))
-    return out
+        item = Item(code, text, timebase_tooltip(desc, code), tier if t is not None else "none")
+        if t is None:
+            out.append(item)
+            continue
+        if text in same and not show_uncalibrated:
+            if code == current:         # the code in force replaces the item for its rate
+                out[next(j for j, it in enumerate(out) if it.text == text)] = item
+        else:
+            out.append(item)
+        same.setdefault(text, []).append(code)
+    return [_with_same(it, same.get(it.text, [])) for it in out]
+
+
+def _with_same(it: Item, codes: List[int]) -> Item:
+    others = [c for c in codes if c != it.value]
+    if not others:
+        return it
+    names = ", ".join(f"0x{c:02X}" for c in others)
+    return Item(it.value, it.text, f"{it.tooltip}; codes {names} give the same rate", it.tier)
 
 
 def vdiv_tooltip(desc: Optional[proto.Description], channel: int, rng: int, probe: int) -> str:

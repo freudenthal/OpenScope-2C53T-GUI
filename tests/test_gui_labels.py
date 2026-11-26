@@ -82,6 +82,44 @@ class TestTimebaseItems(unittest.TestCase):
         self.assertEqual([i.text for i in labels.timebase_items(None, current=5)], ["Not calibrated"])
 
 
+def desc21():
+    """A stage-250 DESCRIPTION: all 21 codes have a rate (EXP-74 ladder),
+    0x00-0x0B provisional, 0x0C-0x14 measured."""
+    rates = ([125_000_000] * 5 + [50_000_000, 25_000_000, 12_500_000, 5_000_000, 2_500_000,
+             1_250_000, 500_000, 250_000, 125_000, 50_000, 25_000, 12_500, 5_000, 2_500, 1_250, 500])
+    tiers = [1] * 12 + [2] * 9
+    return proto.Description(1, samples_per_div=32, rates=tuple(zip(rates, tiers)), counts_per_div=32)
+
+
+class TestTimebaseDuplicates(unittest.TestCase):
+    def test_one_item_per_rate(self):
+        items = labels.timebase_items(desc21())
+        texts = [i.text for i in items]
+        self.assertEqual(len(texts), len(set(texts)))
+        self.assertEqual(len(items), 17)                  # 0x00-0x04 give one item
+        self.assertEqual(items[0].value, 0x00)
+        self.assertEqual(items[0].text, "≈ 256 ns/div")
+        self.assertIn("0x01, 0x02, 0x03, 0x04 give the same rate", items[0].tooltip)
+        self.assertEqual(items[1].value, 0x05)
+        self.assertNotIn("same rate", items[1].tooltip)
+        self.assertEqual([i.value for i in items][-9:], list(range(0x0C, 0x15)))
+
+    def test_current_duplicate_code_takes_the_item(self):
+        items = labels.timebase_items(desc21(), current=0x03)
+        self.assertEqual(len(items), 17)
+        self.assertEqual(items[0].value, 0x03)            # the combo can select what is in force
+        self.assertIn("Timebase code 0x03", items[0].tooltip)
+        self.assertIn("0x00, 0x01, 0x02, 0x04 give the same rate", items[0].tooltip)
+
+    def test_show_uncalibrated_lists_every_code(self):
+        items = labels.timebase_items(desc21(), show_uncalibrated=True)
+        self.assertEqual([i.value for i in items], list(range(21)))
+        self.assertIn("0x00, 0x01, 0x03, 0x04 give the same rate", items[2].tooltip)
+
+    def test_real_fixture_unchanged(self):
+        self.assertEqual([i.value for i in labels.timebase_items(desc())], list(range(0x0D, 0x15)))
+
+
 class TestVdivItems(unittest.TestCase):
     def test_probe_included_and_sorted(self):
         items = labels.vdiv_items(desc(), 1, probe=10)
