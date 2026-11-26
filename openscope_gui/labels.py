@@ -428,6 +428,11 @@ def info_lines(version: str, port: str, st: proto.Status, state: Optional[proto.
 # needs. Firmware with a lower level, or with no section 7, or with the shell
 # only, needs an update.
 REQUIRED_API_LEVEL = 1
+# Stage-275: the newest API level this GUI knows. Level 2 (stage-272) adds
+# SET_METER_MODE and description section 5; on level 1 the Multimeter tab
+# shows readings but cannot select a function. Only firmware above this level
+# gets the "this program is older" note.
+NEWEST_API_LEVEL = 2
 
 UPDATE_NEEDED = "Firmware update needed"
 UPDATE_RECOMMENDED = "Firmware update recommended"
@@ -500,7 +505,7 @@ def compat_case(c: Optional[Compat], bundled=None, required: int = REQUIRED_API_
         return "no_identity"
     if c.api_level < required:
         return "api_lower"
-    if c.api_level > required:
+    if c.api_level > max(required, NEWEST_API_LEVEL):
         return "api_higher"
     return "recommended" if bundled_is_newer(c, bundled) else None
 
@@ -554,7 +559,7 @@ def note_words(text: str) -> str:
 
 
 SET_WORDS = {"mode": "Unit mode", "timebase": "Timebase", "vdiv": "Volts/div", "trigger": "Trigger",
-             "run": "Run/stop", "probe": "Probe"}
+             "run": "Run/stop", "probe": "Probe", "meter_function": "Meter function"}
 
 
 def job_words(job: str, ok: bool, msg: str) -> str:
@@ -565,7 +570,11 @@ def job_words(job: str, ok: bool, msg: str) -> str:
         if ok:
             return f"{name} changed"
         if "UNSUPPORTED_IN_MODE" in msg:
+            if what == "meter_function":
+                return f"{name} not changed: {METER_MODE_NEEDED}"
             return f"{name} not changed: {SCOPE_MODE_NEEDED}"
+        if what == "meter_function" and "BAD_ARG" in msg:
+            return f"{name} not changed: {METER_NOT_USABLE}"
         for nak, words in NOTE_WORDS.items():
             if nak in msg:
                 return f"{name} not changed: {words.lower()}"
@@ -577,6 +586,57 @@ def job_words(job: str, ok: bool, msg: str) -> str:
     if job == "backup":
         return "Calibration backup saved" if ok else f"Calibration backup failed: {note_words(msg)}"
     return f"{job} {'done' if ok else 'failed'}"
+
+
+# ── multimeter (stage-275) ─────────────────────────────────────────────
+# The unit names come from the firmware (description section 5 and METER_FRAME,
+# ASCII). On the screen: a symbol after a value, words in the line under it.
+UNIT_SYMBOLS = {"Ohm": "Ω", "kOhm": "kΩ", "MOhm": "MΩ", "uF": "µF", "C": "°C", "F": "°F"}
+UNIT_WORDS = {"V": "volts", "mV": "millivolts", "A": "amperes", "mA": "milliamperes",
+              "Ohm": "ohms", "kOhm": "kilohms", "MOhm": "megohms", "nF": "nanofarads",
+              "uF": "microfarads", "C": "degrees Celsius", "F": "degrees Fahrenheit"}
+METER_MODE_NEEDED = "the unit is not in multimeter mode"
+METER_NOT_USABLE = "this firmware cannot use that function"
+METER_NO_FUNCTIONS = "This firmware cannot select meter functions. Readings still show."
+METER_CHANGING = "changing…"
+METER_NOT_IN_LIST = "not in this list"
+METER_HOLD_TIP = ("Freezes the value shown here. The log and the chart keep every reading. "
+                  "This is not the unit's own hold.")
+METER_REL_TIP = ("Shows each reading minus the reading at the click (zero). The log keeps "
+                 "the readings as measured.")
+METER_RESET_TIP = "Starts minimum, maximum and average again from the next reading"
+
+
+def unit_symbol(unit: str) -> str:
+    return UNIT_SYMBOLS.get(unit, unit)
+
+
+def unit_words(unit: str) -> str:
+    return UNIT_WORDS.get(unit, unit)
+
+
+def function_tooltip(f) -> str:
+    """Tooltip of a function list item: the code is here, not in the text."""
+    return f"Function number {f.id} on the unit; reads in {unit_words(f.unit)}"
+
+
+def function_line(name: Optional[str], unit: str) -> str:
+    """The line under the meter value: the function and the unit in words."""
+    parts = [p for p in (name, unit_words(unit) if unit else "") if p]
+    return SEP.join(parts)
+
+
+def meter_flags_words(ac: bool, autorange: bool, held_on_unit: bool) -> List[str]:
+    """The METER_FRAME flags in words (no unit key name: AUTO and HOLD are keys)."""
+    return [w for w, on in (("AC", ac), ("automatic range", autorange),
+                            ("held on the unit", held_on_unit)) if on]
+
+
+def fmt_meter(value: Optional[float], decimals: int, unit: str = "", signed: bool = False) -> str:
+    if value is None:
+        return "—"
+    text = f"{value:+.{decimals}f}" if signed else f"{value:.{decimals}f}"
+    return f"{text} {unit_symbol(unit)}".strip()
 
 
 def mode_label_items(modes: Sequence[int] = (0, 1, 2)) -> List[str]:

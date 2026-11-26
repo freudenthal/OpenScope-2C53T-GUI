@@ -7,7 +7,8 @@ the unit reports".
   `set_enabled(on)`. A state update never sends a set (stage-085 rule).
 * `EditSender`: connects one widget to one send call. A spin box or line edit
   sends on "editing finished" (Enter or focus out), a combo box on `activated`
-  (user only). An edit is sent once: Enter and then focus out with the same
+  (user only), a list (stage-275) on a user click or Enter on an item
+  (`itemClicked`, `itemActivated`); the item value is its UserRole data. An edit is sent once: Enter and then focus out with the same
   value send one set, and a value equal to the last value sent or reported
   sends nothing.
 * `show_reported(widget, value)`: writes a reported value into a widget only
@@ -15,7 +16,7 @@ the unit reports".
   a state update never overwrites text being typed and never sends (code review
   2026-11-23 Q-1).
 * `PlaceholderPanel`: one line of text, for a mode whose controls come later
-  (Multimeter stage-275, Signal generator stage-285).
+  (Signal generator stage-285; the Multimeter panel came in stage-275).
 """
 from __future__ import annotations
 
@@ -28,6 +29,9 @@ def widget_value(w: QtWidgets.QWidget) -> Any:
     """The value a widget shows: combo data, spin box value, or edit text."""
     if isinstance(w, QtWidgets.QComboBox):
         return w.currentData()
+    if isinstance(w, QtWidgets.QListWidget):
+        item = w.currentItem()
+        return item.data(QtCore.Qt.UserRole) if item is not None and item.isSelected() else None
     if isinstance(w, QtWidgets.QAbstractSpinBox):
         return w.value()
     if isinstance(w, QtWidgets.QLineEdit):
@@ -46,6 +50,11 @@ def write_value(w: QtWidgets.QWidget, value: Any) -> bool:
     try:
         if isinstance(w, QtWidgets.QComboBox):
             w.setCurrentIndex(w.findData(value))
+        elif isinstance(w, QtWidgets.QListWidget):
+            row = list_row(w, value)
+            w.setCurrentRow(row)
+            if row < 0:
+                w.clearSelection()
         elif isinstance(w, QtWidgets.QAbstractSpinBox):
             w.setValue(value)
         else:
@@ -53,6 +62,14 @@ def write_value(w: QtWidgets.QWidget, value: Any) -> bool:
     finally:
         w.blockSignals(False)
     return True
+
+
+def list_row(w: QtWidgets.QListWidget, value: Any) -> int:
+    """The row whose item has `value` as UserRole data, or -1."""
+    for i in range(w.count()):
+        if w.item(i).data(QtCore.Qt.UserRole) == value:
+            return i
+    return -1
 
 
 def show_reported(w: QtWidgets.QWidget, value: Any) -> bool:
@@ -85,6 +102,9 @@ class EditSender(QtCore.QObject):
         self.sent = 0
         if isinstance(widget, QtWidgets.QComboBox):
             widget.activated.connect(self._edited)
+        elif isinstance(widget, QtWidgets.QListWidget):
+            widget.itemClicked.connect(self._edited)
+            widget.itemActivated.connect(self._edited)
         else:
             widget.editingFinished.connect(self._edited)
 

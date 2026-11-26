@@ -18,6 +18,11 @@ firmware needs an update (labels.compat_text of the worker's compat report),
 with one button that opens the wizard. The unit ID and the git revision show
 only in dialogs, never in the main window.
 
+Stage-275: `self.panels[1]` is the MeterPanel (function list, Hold, Relative,
+min/max/average). Each reading goes to the meter view first, then to the
+panel; the panel's function list follows the reading's function and sends
+nothing.
+
 Stage-260: `self.panels` holds one panels.Panel per tab (mode id -> panel);
 `self.panel` is the scope panel. A disconnect clears every panel and the
 meter. The worker's typed events (worker.Event) come to `_worker_event`: a
@@ -35,6 +40,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from openscope import proto
 from . import dialogs, labels, update_wizard
+from .meter_panel import MeterPanel
 from .panels import Panel, PlaceholderPanel
 from .scope_panel import ScopePanel, continuous
 from .views import MeterView, Rate, ScopeView
@@ -51,8 +57,7 @@ SINGLE_TIP = "Capture one triggered record, then hold it"
 MODE_TIMEOUT_MS = 8000                            # longest SET_MODE (5 s) + margin
 SETTINGS_BANNER = "The unit shows its settings menu"
 PORT_BUSY_TEXT = "Port in use by another program"   # status bar, stage-180 (Q-10)
-PLACEHOLDER = {1: "Multimeter function controls come in stage 275.",
-               2: "Signal generator controls come in stage 285."}
+PLACEHOLDER = {2: "Signal generator controls come in stage 285."}
 VIEW_DEFAULTS = {"view/control_panel": True, "view/unit_keys": False,
                  "view/uncalibrated": False, "view/advanced": False}
 
@@ -129,7 +134,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.channels_changed.connect(self.worker.set_channels)
         self.panel.level_50.connect(self._level_50)
         self.scope.level_dragged.connect(self.panel.set_level_counts)
-        self.panels: Dict[int, Panel] = {0: self.panel, 1: PlaceholderPanel(1, PLACEHOLDER[1]),
+        self.meter_panel = MeterPanel(worker, self.meter)
+        self.panels: Dict[int, Panel] = {0: self.panel, 1: self.meter_panel,
                                          2: PlaceholderPanel(2, PLACEHOLDER[2])}
         self.stack = QtWidgets.QStackedWidget()
         for mode in TAB_MODES:                  # stack index == tab index == mode id
@@ -179,7 +185,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.connection.connect(self._set_conn)
         worker.status.connect(self._status)
         worker.frame.connect(self._frame)
-        worker.meter.connect(self.meter.add)
+        worker.meter.connect(self._meter)
         worker.note.connect(self._note)
         worker.job_done.connect(self._job_done)
         worker.scope_state.connect(self._scope_state)
@@ -357,6 +363,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._event(f"tab follows unit: {labels.MODE_WORDS[mode]}")
 
     def _set_done(self, what: str, ok: bool) -> None:
+        self.meter_panel.set_done(what, ok)
         if what != "mode" or self._pending_mode is None:
             return
         self._pending_mode = None
@@ -432,6 +439,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._follow_mode(s.mode)
         self._update_scope_status()
 
+    def _meter(self, s) -> None:
+        """One new reading: the view (value, chart, log), then the panel."""
+        self.meter.add(s)
+        self.panels[1].set_state(s)
+
     def _frame(self, f: ScopeFrame) -> None:
         self.scope.set_frame(f)
         self._update_scope_status()
@@ -469,6 +481,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if e.kind in ("meter_blank", "meter_ok"):
             self.meter.set_blank(e.kind == "meter_blank")
             self._event(f"event {e.kind} {e.text}".rstrip())
+            # stage-275: a function change makes a blank period each time; its
+            # note goes when the readings come back
+            if e.kind == "meter_ok" and self.sb_note.toolTip().startswith("meter blank"):
+                self.sb_note.setText("")
+                self.sb_note.setToolTip("")
 
     def _job_done(self, job: str, ok: bool, msg: str) -> None:
         self._event(f"job {job} {'ok' if ok else 'FAILED'} {msg}")

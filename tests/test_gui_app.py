@@ -4,6 +4,7 @@ test uses its own temporary QSettings file. Needs the `gui` extra; skipped
 without it."""
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import os
 import queue
@@ -28,6 +29,7 @@ if HAVE_QT:
     from openscope_gui.window import PORT_BUSY_TEXT, SETTINGS_BANNER  # noqa: E402
     from openscope_gui.worker import Event, MeterSample, ScopeFrame, Worker, shell_refused  # noqa: E402
     from openscope_gui.panels import Panel, PlaceholderPanel  # noqa: E402
+    from openscope_gui import labels  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_gui_labels import REAL_DESCRIPTION  # noqa: E402
@@ -614,13 +616,15 @@ class TestStage260Window(WindowCase):
             self.assertIs(w.stack.widget(mode), p)
             self.assertEqual(p.mode, mode)
 
-    def test_placeholders_name_stages_275_and_285(self):
-        self.assertIsInstance(self.win.panels[1], PlaceholderPanel)
-        self.assertIn("stage 275", self.win.panels[1].text())
+    def test_placeholder_names_stage_285_and_the_meter_panel_is_real(self):
+        # stage-275: the Multimeter placeholder is gone
+        from openscope_gui.meter_panel import MeterPanel
+        self.assertIsInstance(self.win.panels[1], MeterPanel)
+        self.assertIsInstance(self.win.panels[2], PlaceholderPanel)
         self.assertIn("stage 285", self.win.panels[2].text())
         self.assertIn("stage 285", self.win.gen_view.findChild(QtWidgets.QLabel).text())
         texts = " ".join(l.text() for l in self.win.findChildren(QtWidgets.QLabel))
-        self.assertNotRegex(texts, r"stage 08[89]")
+        self.assertNotRegex(texts, r"stage (08[89]|275)")
 
     def test_disconnect_clears_all_panels_and_the_meter(self):
         self.connect(mode=1)
@@ -664,6 +668,208 @@ class TestStage260Window(WindowCase):
             lines = f.read().splitlines()
         self.assertEqual([l.split(" ", 2)[2] for l in lines if " event " in l],
                          ["event meter_blank NOT_READY", "event meter_ok"])
+
+
+METER_NAMES = (("DC Voltage", "V"), ("AC Voltage", "V"), ("DC mA", "mA"), ("DC Current", "A"),
+               ("AC mA", "mA"), ("AC Current", "A"), ("Resistance", "kOhm"), ("Continuity", "Ohm"),
+               ("Diode", "V"), ("Capacitance", "nF"), ("Temperature", "C"))
+USABLE = (0, 1, 6, 7, 8)        # stage-270 bench record (stage-272 section 5)
+
+
+def meter_reading(uc, sub=0, val=3.254, unit="V", disp=None, flags=0):
+    disp = f"{val:.3f}" if disp is None else disp
+    return MeterSample(1000.0 + uc, proto.MeterReading(uc, val, 0, 3, 1, flags, sub, 0, unit, disp))
+
+
+class MeterCase(WindowCase):
+    """A stage-272 unit in meter mode: section 5 with five usable functions."""
+
+    def setUp(self):
+        super().setUp()
+        fns = tuple(proto.MeterFunction(i, i in USABLE, n, u) for i, (n, u) in enumerate(METER_NAMES))
+        self.mdesc = dataclasses.replace(self.desc, meter_functions=fns)
+        self.p = self.win.panels[1]
+        self.uc = 0
+
+    def connect_meter(self, desc="section5"):
+        w = self.win
+        w._set_conn("connected", "COMFAKE")
+        w._description(self.mdesc if desc == "section5" else desc)
+        w._status(status(1))
+        w._scope_state(state(mode=1))
+        self.jobs()
+
+    def read(self, sub=0, **kw):
+        self.uc += 1
+        self.win._meter(meter_reading(self.uc, sub, **kw))
+
+    def texts(self):
+        f = self.p.functions
+        return [f.item(i).text() for i in range(f.count())]
+
+    def current(self):
+        it = self.p.functions.currentItem()
+        return it.data(QtCore.Qt.UserRole) if it is not None and it.isSelected() else None
+
+    def user_click(self, fid):
+        """What a mouse click on the item does: it becomes current, then itemClicked."""
+        f = self.p.functions
+        row = next(i for i in range(f.count()) if f.item(i).data(QtCore.Qt.UserRole) == fid)
+        f.setCurrentRow(row)
+        f.itemClicked.emit(f.item(row))
+
+
+class TestMeterPanel(MeterCase):
+    def test_the_list_shows_only_usable_functions_by_name(self):
+        self.connect_meter()
+        self.assertEqual(self.texts(), ["DC Voltage", "AC Voltage", "Resistance", "Continuity", "Diode"])
+        f = self.p.functions
+        self.assertEqual([f.item(i).data(QtCore.Qt.UserRole) for i in range(f.count())], list(USABLE))
+        self.assertIn("Function number 6", f.item(2).toolTip())
+        self.assertTrue(f.isEnabled())
+        self.assertIs(self.win.stack.currentWidget(), self.p)
+
+    def test_a_real_click_queues_one_set(self):
+        self.connect_meter()
+        self.read(0)
+        f = self.p.functions
+        rect = f.visualItemRect(f.item(2))
+        QtTest.QTest.mouseClick(f.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, rect.center())
+        self.assertEqual(self.jobs(), [("set", ("meter_function", (6,)))])
+
+    def test_a_click_shows_changing_until_a_reading_of_that_function(self):
+        self.connect_meter()
+        self.read(0)
+        self.assertEqual(self.current(), 0)
+        self.user_click(6)
+        self.assertEqual(self.jobs(), [("set", ("meter_function", (6,)))])
+        self.assertEqual(self.texts()[2], "Resistance — changing…")
+        self.assertTrue(self.p.timer.isActive())
+        self.assertEqual(self.p.timer.interval(), 6000)
+        self.read(0)                                    # the old function, before the change
+        self.assertEqual((self.current(), self.texts()[2]), (6, "Resistance — changing…"))
+        self.user_click(6)                              # a second click on the waiting item
+        self.read(6, val=4.7, unit="kOhm")
+        self.assertEqual((self.current(), self.texts()[2]), (6, "Resistance"))
+        self.assertFalse(self.p.timer.isActive())
+        self.assertEqual(self.jobs(), [])
+        self.assertEqual(self.win.meter.func.text(), "Resistance · kilohms")
+
+    def test_a_unit_function_change_selects_the_item_and_sends_nothing(self):
+        self.connect_meter()
+        for sub in (0, 6, 7, 8):                        # the Function softkey, 3 changes
+            self.read(sub)
+            self.assertEqual(self.current(), sub)
+            self.assertEqual(self.jobs(), [])
+        self.read(3, unit="A")                          # not usable: no item, says so in words
+        self.assertIsNone(self.current())
+        self.assertEqual(self.p.func_note.text(), "The unit shows DC Current: not in this list")
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_refused_change_goes_back_to_the_function_in_force(self):
+        self.connect_meter()
+        self.read(0)
+        self.user_click(6)
+        self.jobs()
+        self.win._set_done("meter_function", False)
+        self.assertEqual((self.current(), self.texts()[2], self.p.pending), (0, "Resistance", None))
+        self.user_click(6)                              # the same edit can be sent again
+        self.assertEqual(self.jobs(), [("set", ("meter_function", (6,)))])
+
+    def test_no_change_in_6_s_goes_back_and_says_so(self):
+        self.connect_meter()
+        self.read(0)
+        self.user_click(7)
+        self.p.timer.timeout.emit()
+        self.assertEqual((self.current(), self.p.pending, self.texts()[3]), (0, None, "Continuity"))
+        self.assertIn("did not change the function in 6 s", self.p.func_note.text())
+        self.read(7)                                    # the change came late: the list follows
+        self.assertEqual((self.current(), self.p.func_note.text()), (7, ""))
+
+    def test_no_section_5_disables_the_list_and_readings_still_show(self):
+        self.assertEqual(self.desc.meter_functions, ())  # the stage-086 fixture
+        for desc in (self.desc, None):                  # no section 5; no description at all
+            with self.subTest(desc=desc is not None):
+                self.win._set_conn("disconnected", "x")
+                self.connect_meter(desc)
+                self.read(0)
+                self.assertFalse(self.p.functions.isEnabled())
+                self.assertEqual(self.p.functions.count(), 0)
+                self.assertEqual(self.p.func_note.text(), labels.METER_NO_FUNCTIONS)
+                self.assertTrue(self.p.func_note.isVisibleTo(self.win))
+                self.assertEqual(self.win.meter.big.text(), "3.254 V")
+                self.assertTrue(self.p.hold_btn.isEnabled())
+
+    def test_hold_relative_and_reset_send_nothing(self):
+        self.connect_meter()
+        self.read(0, val=1.0)
+        self.p.hold_btn.click()
+        self.read(0, val=2.0)
+        self.assertEqual(self.win.meter.big.text(), "1.000 V")
+        self.p.hold_btn.click()
+        self.p.rel_btn.click()
+        self.read(0, val=1.5)
+        self.assertEqual(self.win.meter.big.text(), "-0.500 V")
+        self.assertEqual((self.p.min_lbl.text(), self.p.max_lbl.text(), self.p.avg_lbl.text(),
+                          self.p.count_lbl.text()), ("1.000 V", "2.000 V", "1.5000 V", "3"))
+        self.p.reset_btn.click()
+        self.assertEqual((self.p.min_lbl.text(), self.p.count_lbl.text()), ("—", "0"))
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_function_change_unchecks_hold_and_relative(self):
+        self.connect_meter()
+        self.read(0)
+        self.p.hold_btn.click()
+        self.p.rel_btn.click()
+        self.read(6, val=4.7, unit="kOhm")
+        self.assertEqual((self.p.hold_btn.isChecked(), self.p.rel_btn.isChecked()), (False, False))
+        self.assertIn("the meter function changed", self.p.tools_note.text())
+        self.assertEqual(self.win.meter.big.text(), "4.700 kΩ")
+        self.assertEqual(self.jobs(), [])
+
+    def test_the_blank_note_goes_when_readings_come_back(self):
+        self.connect_meter()
+        self.win._note("meter blank: NOT_READY")
+        self.win._worker_event(Event("meter_ok", True))
+        self.assertEqual(self.win.sb_note.text(), "")
+        self.win._note("timeout: no reply")                    # another note stays
+        self.win._worker_event(Event("meter_ok", True))
+        self.assertIn("No reply", self.win.sb_note.text())
+
+    def test_disconnect_clears_the_panel(self):
+        self.connect_meter()
+        self.read(0)
+        self.p.hold_btn.click()
+        self.user_click(6)
+        self.win._set_conn("disconnected", "NoDevice: port lost")
+        p = self.p
+        self.assertEqual((p.pending, p.unit_fn, p.hold_btn.isChecked(), p.min_lbl.text()),
+                         (None, None, False, "—"))
+        self.assertEqual(p.func_note.text(), "Waiting for the unit")
+        self.assertFalse(p.functions.isEnabled())
+        self.assertFalse(p.hold_btn.isEnabled())
+        self.assertFalse(p.timer.isActive())
+
+
+class TestNoCodesInTheMultimeterTab(MeterCase):
+    visible_texts = TestNoCodesVisible.visible_texts
+
+    def test_no_hex_code_or_key_name_with_default_view(self):
+        self.connect_meter()
+        self.assertEqual(self.win.tabs.currentIndex(), 1)
+        self.read(6, val=4.7, unit="kOhm", flags=0x04 | 0x08)     # automatic range, held on the unit
+        self.p.hold_btn.click()
+        self.p.rel_btn.click()
+        self.user_click(7)                              # "changing…"
+        self.read(3, unit="A")                          # a function not in the list
+        self.win._job_done("set", False, "meter_function refused: BAD_ARG: hint")
+        texts = self.visible_texts() + self.texts()
+        self.assertTrue(any("Resistance" in t for t in texts))
+        self.assertTrue(any("kilohms" in t or "amperes" in t for t in texts))
+        self.assertEqual([t for t in texts if HEX.search(t)], [])
+        self.assertEqual([t for t in texts if KEY_NAME.search(t)], [])
+        words = [re.sub(r"<[^>]+>", "", t) for t in texts]        # no HTML colour codes
+        self.assertEqual([t for t in words if re.search(r"submode|function \d|#\d|BAD_ARG", t)], [])
 
 
 if __name__ == "__main__":

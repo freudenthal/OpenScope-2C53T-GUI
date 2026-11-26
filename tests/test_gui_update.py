@@ -68,7 +68,9 @@ class TestCompatText(unittest.TestCase):
         need = labels.UPDATE_NEEDED
         cases = {
             "api lower": (Compat("binary", 0, FW), need, True),
-            "api higher": (Compat("binary", 2, FW), "older than the firmware", False),
+            # stage-275: level 2 (stage-272) is known; only a newer level gets the note
+            "api higher": (Compat("binary", labels.NEWEST_API_LEVEL + 1, FW), "older than the firmware",
+                           False),
             "no section 7": (Compat("binary", None, FW), need, True),
             "shell only": (Compat("shell_only"), need, True),
             "iap, no port": (Compat("iap"), "upgrade mode", True),
@@ -81,6 +83,7 @@ class TestCompatText(unittest.TestCase):
                 self.assertEqual(wiz, offer)
                 self.assertNotRegex(text, r"0x[0-9A-Fa-f]|\b[0-9A-F]{24}\b")
         self.assertIsNone(labels.compat_text(Compat("binary", 1, FW)))
+        self.assertIsNone(labels.compat_text(Compat("binary", 2, FW)))     # stage-272 firmware
         self.assertIsNone(labels.compat_text(Compat("none")))
         self.assertIsNone(labels.compat_text(None))
 
@@ -256,15 +259,16 @@ class TestBanner(unittest.TestCase):
         w = self.win
         for c, offer in ((Compat("binary", 0, FW), True), (Compat("binary", None, FW), True),
                          (Compat("shell_only"), True), (Compat("iap"), True), (Compat("stock"), True),
-                         (Compat("binary", 2, FW), False)):
+                         (Compat("binary", labels.NEWEST_API_LEVEL + 1, FW), False)):
             with self.subTest(c.kind, api=c.api_level):
                 self.worker.compat.emit(c)
                 self.assertTrue(w.compat_banner.isVisibleTo(w))
                 self.assertEqual(w.compat_label.text(), labels.compat_text(c)[0])
                 self.assertEqual(w.compat_button.isVisibleTo(w), offer)
                 self.assertEqual(w.compat_button.text(), "Update firmware…")
-        self.worker.compat.emit(Compat("binary", labels.REQUIRED_API_LEVEL, FW))
-        self.assertFalse(w.compat_banner.isVisibleTo(w))
+        for level in (labels.REQUIRED_API_LEVEL, labels.NEWEST_API_LEVEL):
+            self.worker.compat.emit(Compat("binary", level, FW))
+            self.assertFalse(w.compat_banner.isVisibleTo(w))
         self.worker.compat.emit(Compat("iap"))
         w._set_conn("offline", "")
         self.assertFalse(w.compat_banner.isVisibleTo(w))

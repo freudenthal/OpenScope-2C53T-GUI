@@ -8,6 +8,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -300,6 +301,178 @@ class TestMeterStage260(unittest.TestCase):
         self.assertTrue(mm.add(self.sample(1, 5.0)))
         self.assertFalse(mm.add(MeterSample(6.0, proto.MeterReading(2, 0.0, 0, 3, 6, 0, 0, 0, "V", ""))))
         self.assertEqual((list(mm.vs), mm.last.reading.update_count, mm.last_t), ([3.254], 2, 6.0))
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6/numpy/pyqtgraph not installed (pip install -e .[gui])")
+class TestMeterStage275(unittest.TestCase):
+    """Host tools on the MeterModel, words in the MeterView, the function CSV
+    column (stage-275)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    @staticmethod
+    def s(uc, val, unit="V", disp=None, sub=0, cls=1, flags=0):
+        disp = f"{val:.3f}" if disp is None else disp
+        return MeterSample(1000.0 + uc, proto.MeterReading(uc, val, 0, 3, cls, flags, sub, 0, unit, disp))
+
+    @staticmethod
+    def names(*fns):
+        return types.SimpleNamespace(meter_functions=tuple(proto.MeterFunction(i, True, n, u)
+                                                           for i, n, u in fns))
+
+    @staticmethod
+    def rows(path):
+        with open(path, newline="") as f:
+            return list(csv.reader(f))
+
+    def test_hold_freezes_the_shown_value_while_the_model_logs(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.csv")
+            v = views.MeterView()
+            self.assertFalse(v.model.set_hold(True))            # nothing to hold yet
+            v.start_log(path)
+            v.add(self.s(1, 1.0))
+            self.assertTrue(v.model.set_hold(True))
+            v.show_value()
+            for uc, val in ((2, 2.0), (3, 3.0), (4, 4.0)):
+                v.add(self.s(uc, val))
+            self.assertEqual(v.big.text(), "1.000 V")
+            self.assertIn("Hold", v.tools.text())
+            self.assertEqual(list(v.vs), [1.0, 2.0, 3.0, 4.0])  # the chart keeps every reading
+            v.stop_log()
+            self.assertEqual([r[2] for r in self.rows(path)[1:]], ["1.0", "2.0", "3.0", "4.0"])
+            v.model.set_hold(False)
+            v.show_value()
+            self.assertEqual((v.big.text(), v.tools.text()), ("4.000 V", ""))
+
+    def test_relative_subtracts_and_the_log_keeps_the_raw_reading(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.csv")
+            mm = views.MeterModel()
+            self.assertFalse(mm.set_relative(True))             # no reading yet
+            mm.start_log(path)
+            mm.add(self.s(1, 3.254))
+            self.assertTrue(mm.set_relative(True))
+            self.assertEqual(mm.shown_text(), "+0.000 V")
+            mm.add(self.s(2, 3.300))
+            self.assertEqual(mm.shown_text(), "+0.046 V")
+            mm.add(self.s(3, 3.200))
+            self.assertEqual(mm.shown_text(), "-0.054 V")
+            mm.add(self.s(4, 0.0, disp="OL", cls=3))            # no value: shown as the unit shows it
+            self.assertEqual(mm.shown_text(), "OL V")
+            mm.stop_log()
+            self.assertEqual([r[2] for r in self.rows(path)[1:]], ["3.254", "3.3", "3.2", "0.0"])
+            mm.set_relative(False)
+            self.assertFalse(mm.set_relative(True))             # the last reading has no value
+
+    def test_an_automatic_range_change_keeps_relative_and_the_statistics(self):
+        mm = views.MeterModel()
+        mm.add(self.s(1, 1.5))
+        mm.set_relative(True)
+        mm.add(self.s(2, 500.0, "mV", "500.0"))
+        self.assertTrue(mm.relative)
+        self.assertEqual(mm.shown_text(), "-1000.0 mV")
+        self.assertEqual(mm.tools_note, "")
+        lo, hi, avg, n = mm.stats("V")
+        self.assertEqual(n, 2)
+        for got, want in ((lo, 0.5), (hi, 1.5), (avg, 1.0)):
+            self.assertAlmostEqual(got, want)
+        self.assertAlmostEqual(mm.stats()[1], 1500.0)           # default: the last reading's unit
+
+    def test_min_max_average_over_a_known_series_and_reset(self):
+        mm = views.MeterModel()
+        self.assertIsNone(mm.stats())
+        for uc, val in enumerate((2.0, 5.0, 3.0, 6.0), start=1):
+            mm.add(self.s(uc, val))
+        mm.add(self.s(9, 0.0, disp="OL", cls=3))                # overrange: not a value
+        lo, hi, avg, n = mm.stats()
+        self.assertEqual((lo, hi, n), (2.0, 6.0, 4))
+        self.assertAlmostEqual(avg, 4.0)
+        mm.reset_stats()
+        self.assertIsNone(mm.stats())
+        mm.add(self.s(10, 7.0))
+        self.assertEqual(mm.stats(), (7.0, 7.0, 7.0, 1))
+
+    def test_a_function_change_ends_hold_relative_and_statistics(self):
+        mm = views.MeterModel()
+        mm.add(self.s(1, 1.0))
+        mm.set_hold(True)
+        mm.set_relative(True)
+        mm.add(self.s(2, 4.7, "kOhm", sub=6))
+        self.assertEqual((mm.hold, mm.relative, mm.stats()[3]), (False, False, 1))
+        self.assertEqual(mm.tools_note, "the meter function changed")
+        self.assertEqual(mm.shown_text(), "4.700 kΩ")
+        mm.add(self.s(3, 4.8, "kOhm", sub=6))
+        self.assertEqual(mm.tools_note, "")
+
+    def test_a_function_change_starts_a_new_chart_also_with_the_same_unit(self):
+        mm = views.MeterModel()
+        mm.add(self.s(1, 3.255))
+        mm.add(self.s(2, 0.620, sub=8))                         # DC V -> Diode: both volts
+        self.assertEqual(list(mm.vs), [0.620])
+
+    def test_an_overload_reading_names_the_unit_of_its_function(self):
+        v = views.MeterView()
+        v.model.set_names(self.names((6, "Resistance", "kOhm")))
+        v.add(self.s(1, 0.0, "", "OL", sub=6, cls=3))           # bench: OL comes with no unit
+        self.assertEqual((v.big.text(), v.func.text()), ("OL", "Resistance · kilohms"))
+
+    def test_a_unit_of_another_kind_ends_relative_and_statistics(self):
+        mm = views.MeterModel()
+        mm.add(self.s(1, 24.8, "C", "24.8", sub=10))
+        mm.set_relative(True)
+        mm.add(self.s(2, 76.6, "F", "76.6", sub=10))
+        self.assertFalse(mm.relative)
+        self.assertEqual(mm.stats()[3], 1)
+        self.assertIn("degrees Fahrenheit", mm.tools_note)
+
+    def test_csv_has_the_function_name_as_the_last_column(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.csv")
+            mm = views.MeterModel()
+            mm.set_names(self.names((0, "DC Voltage", "V")))
+            mm.start_log(path)
+            mm.add(self.s(1, 1.0))
+            mm.add(self.s(2, 4.7, "kOhm", sub=6))               # not listed: empty name
+            mm.stop_log()
+            rows = self.rows(path)
+            self.assertEqual(rows[0], views.CSV_HEADER)
+            self.assertEqual(rows[0][:12], ["t_unix", "update_count", "value", "unit", "display",
+                                            "raw_bcd", "decimal_pos", "result", "submode", "ac",
+                                            "autorange", "hold"])      # stage-260 columns first
+            self.assertEqual((rows[0][-1], rows[1][-1], rows[2][-1]), ("function", "DC Voltage", ""))
+            self.assertEqual(len(rows[1]), len(views.CSV_HEADER))
+
+    def test_an_older_header_is_not_appended_to(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.csv")
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerows([views.CSV_HEADER[:-1], ["1.0"] * 12])
+            for run in range(2):                                # the second run appends to -2
+                v = views.MeterView()
+                used = v.start_log(path)
+                self.assertEqual(used, os.path.join(d, "m-2.csv"))
+                self.assertIn("older columns", v.log_label.text())
+                v.add(self.s(run + 1, 1.0))
+                v.stop_log()
+            self.assertEqual(len(self.rows(path)), 2)           # the old file is unchanged
+            new = self.rows(used)
+            self.assertEqual((new[0], len(new)), (views.CSV_HEADER, 3))
+
+    def test_function_unit_and_flags_in_words(self):
+        v = views.MeterView()
+        v.model.set_names(self.names((6, "Resistance", "kOhm")))
+        v.add(self.s(1, 4.7, "kOhm", sub=6, flags=0x04 | 0x08))
+        self.assertEqual(v.big.text(), "4.700 kΩ")
+        self.assertEqual(v.func.text(), "Resistance · kilohms")
+        self.assertIn("automatic range", v.info.text())
+        self.assertIn("held on the unit", v.info.text())
+        self.assertNotRegex(v.info.text(), r"\b(AUTO|HOLD)\b|#")
+        v.model.set_names(None)                                 # firmware without section 5
+        v.add(self.s(2, 4.7, "kOhm", sub=6))
+        self.assertEqual(v.func.text(), "kilohms")
 
 
 if __name__ == "__main__":

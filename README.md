@@ -37,7 +37,15 @@ package. The GUI needs a firmware build with the same protocol version as the li
   The level is in volts on the source channel, relative to the middle of the screen (in percent
   of the screen on a range with no volts meaning). Codes (timebase code, range, register value)
   are in the tooltips only. The panel shows the state the unit reports back after each set, never
-  the value it asked for. The Multimeter and Signal generator panels come in later stages.
+  the value it asked for. The Signal generator panel comes in a later stage.
+* **Multimeter panel:** the meter functions that the firmware marks usable (DC voltage, AC
+  voltage, resistance, continuity and diode on API level 2 firmware), by name. A click selects
+  the function on the unit; the item shows "changing…" until a reading of that function comes
+  (about 2.5 s). A change on the unit (its Function softkey) moves the list and sends nothing.
+  Hold (freezes the shown value), Relative (shows the reading minus the reading at the click) and
+  minimum/maximum/average are in this program only: they send nothing, and the CSV log keeps the
+  readings as measured, with the function name as the last column. Firmware before API level 2
+  cannot select functions: the list is disabled and the readings still show.
 * **Menus:** File (Save LCD screenshot, Save waveform as CSV or NPZ, Record meter to CSV, Exit),
   View (Control panel, Unit keys, Show uncalibrated settings, Advanced tools), Device (Connect,
   Disconnect, Port, Device information, Back up calibration, Update firmware), Tools (with Advanced tools: Debug console, which never
@@ -53,7 +61,8 @@ package. The GUI needs a firmware build with the same protocol version as the li
   record was taken with other settings), link and draw rates.
 
 The plot shows raw ADC counts, two cursors (Δt, Δcounts), an FFT tab and the measurements; the
-meter tab has a strip chart and the CSV log. The screenshot stops the scope for the dump and runs
+meter tab has the value with its function and unit in words, a strip chart and the CSV log (a
+file with older columns is not appended to: the log goes to `<name>-2.csv`). The screenshot stops the scope for the dump and runs
 it again, so the screen passes the CRC. The window recovers by itself after an unplug. Bench
 options: `--stats CSV` (rates once a second), `--events TXT`, `--meter-log CSV`, `--grab PNG`,
 `--quit-after S`, `--channels 1,2`. One reader thread (`worker.py`) owns the port; a 30 Hz
@@ -112,10 +121,11 @@ powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1 -Version 0.
 | `worker.py` | reader `QThread`: the only owner of the port; jobs in, frames and state out |
 | `window.py` | tabs, menus, toolbar, docks |
 | `scope_panel.py` | Oscilloscope control panel |
+| `meter_panel.py` | Multimeter control panel (function list, Hold, Relative, min/max/average) |
 | `dialogs.py` | Device information, Debug console, About |
 | `update_wizard.py` | calibration backup dialog, firmware update wizard and its runner thread |
 | `labels.py` | practical-unit text from the unit's description |
-| `views.py` | plots, FFT, cursors, meter strip chart and CSV |
+| `views.py` | plots, FFT, cursors, meter model (host tools), strip chart and CSV |
 | `app.py` | entry point (`openscope-gui`) |
 
 ## Tests (no hardware)

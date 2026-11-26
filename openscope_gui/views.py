@@ -7,20 +7,23 @@ the axis is in samples. Samples [0, head_skip) are the record-head defect and
 are shaded and left out of every measurement.
 
 Stage-260: the meter is a MeterModel (data, blank state, CSV log) and a
-MeterView (the widget that draws from it).
+MeterView (the widget that draws from it). Stage-275: the model has the host
+tools (Hold, Relative, minimum/maximum/average) and a "function" CSV column.
 """
 from __future__ import annotations
 
 import csv
 import os
+import re
 import time
 from collections import deque
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import labels
 from .worker import MeterSample, ScopeFrame
 
 CH_COLORS = ("#f2c94c", "#56ccf2")      # CH1 yellow, CH2 cyan (the unit's own colours)
@@ -314,8 +317,45 @@ class ScopeView(QtWidgets.QWidget):
 
 
 # ── meter ─────────────────────────────────────────────────────────────
+# Stage-275: "function" (the function name from description section 5) is the
+# last column, so readers of the first columns still work.
 CSV_HEADER = ["t_unix", "update_count", "value", "unit", "display", "raw_bcd", "decimal_pos",
-              "result", "submode", "ac", "autorange", "hold"]
+              "result", "submode", "ac", "autorange", "hold", "function"]
+_PREFIX = {"m": 1e-3, "u": 1e-6, "n": 1e-9, "k": 1e3, "M": 1e6}
+_BASES = ("V", "A", "Ohm", "F")
+_DECIMALS = re.compile(r"\.(\d+)")
+
+
+def unit_scale(unit: str) -> Tuple[str, float]:
+    """('mV') -> ('V', 1e-3): the base unit and the factor to it. A unit with
+    no known prefix is its own base ('C' and 'F' for temperature too)."""
+    if len(unit) > 1 and unit[0] in _PREFIX and unit[1:] in _BASES:
+        return unit[1:], _PREFIX[unit[0]]
+    return unit, 1.0
+
+
+def display_decimals(display: str) -> int:
+    """Digits after the point in the unit's display text ('3.254' -> 3)."""
+    m = _DECIMALS.search(display or "")
+    return len(m.group(1)) if m else 0
+
+
+def free_log_path(path: str) -> str:
+    """`path` if it is new, empty or has this header; else the first
+    `<name>-N<ext>` (N = 2, 3, ...) that is. Stage-275: rows are never
+    appended under an older header."""
+    def usable(p: str) -> bool:
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            return True
+        with open(p, newline="") as f:
+            return next(csv.reader(f), []) == CSV_HEADER
+    if usable(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 2
+    while not usable(f"{stem}-{n}{ext}"):
+        n += 1
+    return f"{stem}-{n}{ext}"
 
 
 class MeterModel:
@@ -326,7 +366,19 @@ class MeterModel:
     appends: `start_log()` writes the header only to an empty file, so a
     restart with the same name keeps the earlier rows (review Q-8). A blank
     period (NAK NOT_READY) adds no CSV row; the --events log has its start and
-    end."""
+    end.
+
+    Stage-275 host tools. They never send a command; the log and the chart
+    keep the readings as measured:
+      * Hold freezes the shown reading (`shown_sample()`). It is not the
+        unit's own HOLD flag;
+      * Relative shows each reading minus the reading at the click;
+      * minimum, maximum and average of the normal readings since the reset.
+    A value in another unit of the same base (mV and V, kOhm and MOhm) is
+    scaled, so an automatic range change keeps Relative and the statistics. A
+    function change (another `submode`) ends all three and starts a new chart;
+    a unit of another base ends Relative and the statistics. `tools_note` says
+    why."""
     HISTORY = 1200
 
     def __init__(self):
@@ -339,11 +391,26 @@ class MeterModel:
         self.blank = False
         self.log_file = None
         self.log_writer = None
+        self.log_path: Optional[str] = None
         self.logged = 0
+        self.names: Dict[int, str] = {}         # submode -> function name (section 5)
+        self.units: Dict[int, str] = {}         # submode -> the function's unit (section 5)
+        self.hold = False
+        self.held: Optional[MeterSample] = None
+        self.rel_ref: Optional[float] = None    # in the base unit
+        self.rel_base = ""
+        self.tools_note = ""                    # why the host tools ended at the last reading
+        self.reset_stats()
 
+    # ── readings ──────────────────────────────────────────────────
     def add(self, s: MeterSample) -> bool:
         """Store and log one reading. True if the chart got a point."""
         m = s.reading
+        prev = self.last
+        self.tools_note = ""
+        if prev is not None and m.submode != prev.reading.submode:
+            self.end_tools("the meter function changed")
+            self.clear_chart()                  # also when the unit stays (DC V -> Diode)
         self.last, self.last_t, self.blank = s, s.t_unix, False
         point = m.result == "normal"
         if point:
@@ -355,14 +422,117 @@ class MeterModel:
                 self.t0 = s.t_unix
             self.ts.append(s.t_unix - self.t0)
             self.vs.append(m.value)
+            base, k = unit_scale(m.unit)
+            if self.relative and base != self.rel_base:
+                self.set_relative(False)
+                self.tools_note = f"the unit changed to {labels.unit_words(m.unit)}"
+            if self.n and base != self.stats_base:
+                self.reset_stats()
+                self.tools_note = f"the unit changed to {labels.unit_words(m.unit)}"
+            v = m.value * k
+            self.stats_base = base
+            self.n += 1
+            self.vsum += v
+            self.vmin = v if self.vmin is None else min(self.vmin, v)
+            self.vmax = v if self.vmax is None else max(self.vmax, v)
         if self.log_writer:
             self.log_writer.writerow([f"{s.t_unix:.3f}", m.update_count, m.value, m.unit,
                                       m.display, m.raw_bcd, m.decimal_pos, m.result, m.submode,
-                                      int(m.ac), int(m.autorange), int(m.hold)])
+                                      int(m.ac), int(m.autorange), int(m.hold),
+                                      self.names.get(m.submode, "")])
             self.log_file.flush()
             self.logged += 1
         return point
 
+    def set_names(self, desc) -> None:
+        """Function names from the description (None or no section 5: none)."""
+        fns = getattr(desc, "meter_functions", ()) if desc is not None else ()
+        self.names = {f.id: f.name for f in fns}
+        self.units = {f.id: f.unit for f in fns}
+
+    def function_name(self, submode: Optional[int] = None) -> Optional[str]:
+        """The name of `submode` (default: the last reading's), or None."""
+        if submode is None:
+            if self.last is None:
+                return None
+            submode = self.last.reading.submode
+        return self.names.get(submode)
+
+    # ── host tools (stage-275) ────────────────────────────────────
+    def set_hold(self, on: bool) -> bool:
+        """Freeze the shown reading at the last one. False (and no hold) when
+        there is no reading yet."""
+        if on and self.last is None:
+            on = False
+        self.hold, self.held = on, (self.last if on else None)
+        return on
+
+    def set_relative(self, on: bool) -> bool:
+        """Zero at the last reading. False (and off) when the last reading has
+        no value (none yet, overload, blank)."""
+        m = self.last.reading if self.last is not None else None
+        if on and m is not None and m.result == "normal":
+            self.rel_base, k = unit_scale(m.unit)
+            self.rel_ref = m.value * k
+            return True
+        self.rel_ref, self.rel_base = None, ""
+        return False
+
+    @property
+    def relative(self) -> bool:
+        return self.rel_ref is not None
+
+    def reset_stats(self) -> None:
+        self.n = 0
+        self.vsum = 0.0
+        self.vmin: Optional[float] = None       # in the base unit
+        self.vmax: Optional[float] = None
+        self.stats_base = ""
+
+    def end_tools(self, why: str) -> None:
+        """Hold, Relative and the statistics end (a function change)."""
+        if self.hold or self.relative or self.n:
+            self.tools_note = why
+        self.set_hold(False)
+        self.set_relative(False)
+        self.reset_stats()
+
+    def stats(self, unit: Optional[str] = None) -> Optional[Tuple[float, float, float, int]]:
+        """(minimum, maximum, average, count) in `unit` (default: the last
+        normal reading's unit), or None with no normal reading since the reset."""
+        if not self.n:
+            return None
+        base, k = unit_scale(self.unit if unit is None else unit)
+        if base != self.stats_base:
+            k = 1.0
+        return self.vmin / k, self.vmax / k, self.vsum / self.n / k, self.n
+
+    def rel_value(self, unit: Optional[str] = None) -> Optional[float]:
+        """The Relative zero in `unit` (default: the last normal reading's)."""
+        if not self.relative:
+            return None
+        base, k = unit_scale(self.unit if unit is None else unit)
+        return self.rel_ref / (k if base == self.rel_base else 1.0)
+
+    def shown_sample(self) -> Optional[MeterSample]:
+        return self.held if self.hold else self.last
+
+    def shown_text(self) -> str:
+        """The big value: the shown reading, relative when Relative is on."""
+        s = self.shown_sample()
+        if s is None:
+            return "—"
+        m = s.reading
+        if self.relative and m.result == "normal":
+            base, k = unit_scale(m.unit)
+            if base == self.rel_base:
+                return labels.fmt_meter((m.value * k - self.rel_ref) / k,
+                                        display_decimals(m.display), m.unit, signed=True)
+        if not m.display.strip():
+            return "—"
+        return f"{m.display} {labels.unit_symbol(m.unit)}".strip()
+
+    # ── state ─────────────────────────────────────────────────────
     def set_blank(self, on: bool) -> None:
         self.blank = on
 
@@ -378,20 +548,26 @@ class MeterModel:
         self.t0 = None
 
     def clear(self) -> None:
-        """No unit: no value, no chart, no age. The log stays open."""
+        """No unit: no value, no chart, no age, no host tools. The log stays open."""
         self.clear_chart()
+        self.end_tools("")
         self.unit = ""
         self.last = self.last_t = None
         self.blank = False
 
-    def start_log(self, path: str) -> None:
+    def start_log(self, path: str) -> str:
+        """Open the log; returns the path used (another one when `path` has
+        older columns: free_log_path)."""
         self.stop_log()
+        path = free_log_path(path)
         self.log_file = open(path, "a", newline="")
         self.log_writer = csv.writer(self.log_file)
+        self.log_path = path
         if os.fstat(self.log_file.fileno()).st_size == 0:
             self.log_writer.writerow(CSV_HEADER)
             self.log_file.flush()
         self.logged = 0
+        return path
 
     def stop_log(self) -> None:
         if self.log_file:
@@ -407,7 +583,11 @@ def age_words(age: Optional[float]) -> str:
 
 class MeterView(QtWidgets.QWidget):
     """The meter widget: draws from its MeterModel. During a blank period the
-    value is grey and the line under it gives its age (review Q-7)."""
+    value is grey and the line under it gives its age (review Q-7).
+
+    Stage-275: the line under the value gives the function and the unit in
+    words; the line under that tells when Hold or Relative is on. The flags
+    are in words (no unit key names)."""
     HISTORY = MeterModel.HISTORY
     LIVE_STYLE = ""
     BLANK_STYLE = "color:#8a8a8a"
@@ -424,6 +604,14 @@ class MeterView(QtWidgets.QWidget):
         fnt.setPointSize(36)
         self.big.setFont(fnt)
         self.big.setAlignment(QtCore.Qt.AlignCenter)
+        self.func = QtWidgets.QLabel("")
+        self.func.setAlignment(QtCore.Qt.AlignCenter)
+        fb = self.func.font()
+        fb.setPointSize(fb.pointSize() + 3)
+        self.func.setFont(fb)
+        self.tools = QtWidgets.QLabel("")
+        self.tools.setAlignment(QtCore.Qt.AlignCenter)
+        self.tools.setStyleSheet("color:#2d9cdb; font-weight:bold")
         self.info = QtWidgets.QLabel("")
         self.info.setAlignment(QtCore.Qt.AlignCenter)
         self.age = QtWidgets.QLabel("")
@@ -447,6 +635,8 @@ class MeterView(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.big)
+        lay.addWidget(self.func)
+        lay.addWidget(self.tools)
         lay.addWidget(self.info)
         lay.addWidget(self.age)
         lay.addWidget(self.plot, 1)
@@ -476,15 +666,36 @@ class MeterView(QtWidgets.QWidget):
         if self.model.add(s):
             self._dirty = True
         if self.model.unit != unit:
-            self.plot.setLabel("left", f"reading ({self.model.unit})")
-        self.big.setText(f"{m.display} {m.unit}".strip() if m.display.strip() else "—")
+            self.plot.setLabel("left", f"reading ({labels.unit_symbol(self.model.unit)})")
         self.big.setStyleSheet(self.LIVE_STYLE)
-        flags = [x for x, on in (("AC", m.ac), ("AUTO", m.autorange), ("HOLD", m.hold)) if on]
-        self.info.setText(f"#{m.update_count}  {m.result}  {' '.join(flags)}  "
-                          f"value {m.value:g} {m.unit}")
+        flags = labels.meter_flags_words(m.ac, m.autorange, m.hold)
+        self.info.setText(labels.SEP.join([f"reading {m.update_count}", m.result] + flags
+                                          + [f"value {m.value:g} {labels.unit_symbol(m.unit)}"]))
+        self.show_value()
         self._show_age()
         if self.model.log_writer:
-            self.log_label.setText(f"logging: {self.model.logged} rows → {self.model.log_file.name}")
+            self.log_label.setText(f"logging: {self.model.logged} rows → {self.model.log_path}")
+
+    def show_value(self) -> None:
+        """The value, the function line and the tools line from the model
+        (after a reading, and after a Hold or Relative click)."""
+        mm = self.model
+        self.big.setText(mm.shown_text())
+        s = mm.shown_sample()
+        if s is not None:                       # an overload reading has no unit: the function's
+            r = s.reading
+            self.func.setText(labels.function_line(mm.function_name(r.submode),
+                                                   r.unit or mm.units.get(r.submode, "")))
+        else:
+            self.func.setText("")
+        tools = []
+        if mm.hold:
+            tools.append("Hold: value frozen (logging continues)")
+        if mm.relative:
+            dec = display_decimals(mm.last.reading.display) if mm.last is not None else 3
+            unit = mm.unit if unit_scale(mm.unit)[0] == mm.rel_base else mm.rel_base
+            tools.append(f"Relative to {labels.fmt_meter(mm.rel_value(unit), dec, unit)}")
+        self.tools.setText(labels.SEP.join(tools))
 
     def set_blank(self, on: bool) -> None:
         """The worker's meter_blank (on) / meter_ok (off) event."""
@@ -516,15 +727,21 @@ class MeterView(QtWidgets.QWidget):
         self.model.clear()
         self.big.setText("—")
         self.big.setStyleSheet(self.LIVE_STYLE)
+        self.func.setText("")
+        self.tools.setText("")
         self.info.setText("")
         self._show_age()
         self.plot.setLabel("left", "reading")
         self.curve.setData([], [])
         self._dirty = False
 
-    def start_log(self, path: str) -> None:
-        self.model.start_log(path)
-        self.log_label.setText(f"logging → {path}")
+    def start_log(self, path: str) -> str:
+        used = self.model.start_log(path)
+        if used != path:
+            self.log_label.setText(f"logging → {used} ({os.path.basename(path)} has older columns)")
+        else:
+            self.log_label.setText(f"logging → {used}")
+        return used
 
     def stop_log(self) -> None:
         f = self.model.log_file

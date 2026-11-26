@@ -53,7 +53,9 @@ calbackup.make_backup() on the worker's Device.
 Stage-260: one structure for every unit mode. `POLLERS` maps each mode to its
 poller (the generator entry sends nothing until stage-285). `SETTERS` maps
 each setting to (Device method, read-back kind), and a set runs only the
-read-back of its kind (`READBACKS`). `caps` holds one capability flag per
+read-back of its kind (`READBACKS`). Stage-275: `set("meter_function", id)`
+(SET_METER_MODE); a refusal names the hint for that request when the library
+has one (proto.NAK_HINTS_BY_CMD). `caps` holds one capability flag per
 kind, None ("not asked") after each connect; `has_state` is the read-only
 scope flag. The `event` signal carries a typed `Event` (nak, meter_blank,
 meter_ok, job, protocol, timeout) next to the text signals. A blank meter
@@ -90,7 +92,10 @@ CAPS = ("scope", "meter", "siggen")
 # stage-260 read-back kinds). A set runs only its own read-back.
 SETTERS = {"mode": ("set_mode", "scope"), "timebase": ("set_timebase", "scope"),
            "vdiv": ("set_vdiv", "scope"), "trigger": ("set_trigger", "scope"),
-           "run": ("run_stop", "scope"), "probe": ("set_probe", "scope")}
+           "run": ("run_stop", "scope"), "probe": ("set_probe", "scope"),
+           # stage-275: SET_METER_MODE (stage-272); ACK = queued, the reading's
+           # submode shows the function in force
+           "meter_function": ("set_meter_function", "meter")}
 NOT_READY = 0x07
 METER_BLANK_NOTE = "meter blank: NOT_READY"
 # I-40: never sent to the unit, whatever the user types in the debug console.
@@ -245,7 +250,8 @@ class Worker(QtCore.QThread):
         self._jobs.put(("screenshot", (path, hold)))
 
     def set(self, what: str, *args) -> None:
-        """Queue one scope set: mode, timebase, vdiv, trigger or run (stage-085)."""
+        """Queue one set: mode, timebase, vdiv, trigger, run, probe (stage-085)
+        or meter_function (stage-275)."""
         if what not in SETTERS:
             raise ValueError(f"unknown setting {what!r}; one of {', '.join(SETTERS)}")
         self._jobs.put(("set", (what, args)))
@@ -558,7 +564,9 @@ class Worker(QtCore.QThread):
             except Nak as e:
                 name = proto.ERRORS.get(e.code, hex(e.code))
                 what = f"{arg[0]} " if job == "set" else ""
-                self._done(job, False, f"{what}refused: {name}: {proto.NAK_HINTS.get(name, '')}".rstrip(": "))
+                hint = (getattr(proto, "NAK_HINTS_BY_CMD", {}).get((e.cmd, name))
+                        or proto.NAK_HINTS.get(name, ""))
+                self._done(job, False, f"{what}refused: {name}: {hint}".rstrip(": "))
             except Exception as e:
                 # Every job reports (review Q-5: a non-ASCII shell line raised
                 # UnicodeEncodeError and the job never ended). A link loss then

@@ -818,5 +818,57 @@ class TestWorkerStage260(unittest.TestCase):
         self.assertTrue(set(self.kinds()) <= set(worker_mod.EVENT_KINDS))
 
 
+class MeterDevice(FakeDevice):
+    """FakeDevice with the stage-272 meter function set."""
+
+    def set_meter_function(self, fid):
+        self.calls.append(("set_meter_function", fid))
+        if self.set_error is not None:
+            raise self.set_error
+
+
+def nak_code(name):
+    return next(k for k, v in proto.ERRORS.items() if v == name)
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6/numpy not installed (pip install -e .[gui])")
+class TestWorkerStage275(unittest.TestCase):
+    """The meter_function setter (stage-275)."""
+    setUpClass = TestWorker.setUpClass
+    states = TestWorker.states
+    make = TestWorker.make
+
+    def test_meter_function_set_calls_the_library_then_reads_the_meter(self):
+        self.assertEqual(worker_mod.SETTERS["meter_function"], ("set_meter_function", "meter"))
+        dev = MeterDevice(mode=1)
+        w = self.make(Opener(dev), status_s=10.0)
+        w.step()
+        n = dev.calls.count("scope_state")
+        w.set("meter_function", 6)
+        w.step()
+        i = dev.calls.index(("set_meter_function", 6))
+        self.assertEqual(dev.calls[i + 1], "meter")             # read-back kind "meter"
+        self.assertEqual(dev.calls.count("scope_state"), n)     # no scope read-back
+        self.assertEqual(self.ev["job"][-1], ("set", True, "meter_function 6"))
+
+    def test_a_refusal_names_the_hint_for_that_request(self):
+        from openscope_gui import labels
+        for name, words in (("BAD_ARG", labels.METER_NOT_USABLE),
+                            ("UNSUPPORTED_IN_MODE", labels.METER_MODE_NEEDED)):
+            with self.subTest(name):
+                dev = MeterDevice(mode=1)
+                w = self.make(Opener(dev))
+                w.step()
+                dev.set_error = Nak(proto.CMD_SET_METER_MODE, nak_code(name))
+                w.set("meter_function", 6)
+                w.step()
+                job, ok, msg = self.ev["job"][-1]
+                self.assertEqual((job, ok), ("set", False))
+                self.assertIn(f"meter_function refused: {name}", msg)
+                self.assertIn(proto.NAK_HINTS_BY_CMD[(proto.CMD_SET_METER_MODE, name)], msg)
+                self.assertEqual(labels.job_words(job, ok, msg), f"Meter function not changed: {words}")
+                self.assertEqual(self.states(), ["connected"])
+
+
 if __name__ == "__main__":
     unittest.main()

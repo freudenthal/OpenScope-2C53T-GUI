@@ -135,5 +135,56 @@ class TestPanels(unittest.TestCase):
         self.assertTrue(p.isEnabled())
 
 
+@unittest.skipUnless(HAVE_QT, "PySide6/numpy/pyqtgraph not installed (pip install -e .[gui])")
+class TestListSender(unittest.TestCase):
+    """Stage-275: EditSender on a QListWidget (the meter function list)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.lw = QtWidgets.QListWidget()
+        for name, fid in (("a", 0), ("b", 6), ("c", 7)):
+            it = QtWidgets.QListWidgetItem(name)
+            it.setData(QtCore.Qt.UserRole, fid)
+            self.lw.addItem(it)
+        self.lw.show()
+        self.sent = []
+        self.rows = []
+        self.lw.currentRowChanged.connect(self.rows.append)
+        self.es = panels.EditSender(self.lw, self.sent.append)
+
+    def tearDown(self):
+        self.lw.hide()
+        self.lw.deleteLater()
+
+    def click(self, row):
+        rect = self.lw.visualItemRect(self.lw.item(row))
+        QtTest.QTest.mouseClick(self.lw.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                                rect.center())
+
+    def test_a_click_sends_once_and_the_same_item_sends_nothing(self):
+        self.es.show_reported(0)
+        self.click(1)
+        self.assertEqual(self.sent, [6])
+        self.click(1)
+        self.assertEqual(self.sent, [6])
+        self.assertEqual(self.es.sent, 1)
+
+    def test_show_reported_selects_with_signals_blocked(self):
+        self.assertTrue(self.es.show_reported(7))
+        self.assertEqual((self.lw.currentRow(), self.sent, self.rows), (2, [], []))
+        self.assertTrue(self.es.show_reported(99))              # not in the list: no selection
+        self.assertEqual((panels.widget_value(self.lw), self.sent, self.rows), (None, [], []))
+
+    def test_a_refused_item_can_be_sent_again_after_the_report(self):
+        self.es.show_reported(0)
+        self.click(1)
+        self.es.show_reported(0)                                # the unit kept function 0
+        self.click(1)
+        self.assertEqual(self.sent, [6, 6])
+
+
 if __name__ == "__main__":
     unittest.main()
